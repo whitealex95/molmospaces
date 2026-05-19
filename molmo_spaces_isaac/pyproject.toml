@@ -16,6 +16,7 @@ dependencies = [
     "msgspec",
     "lmdb~=1.7.5",
     "zstandard~=0.25.0",
+    "molmospaces-resources",
 ]
 
 [build-system]
@@ -41,6 +42,9 @@ override-dependencies = [
     "torch>=2.9.0", # Change here for different CUDA version
     "torchvision>=0.24.0", # Change here for different CUDA version
 ]
+# flatdict==4.0.1 (transitive via isaaclab) calls pkg_resources at build time;
+# setuptools>=81 dropped it from implicit imports, breaking the sdist build.
+build-constraint-dependencies = ["setuptools<81"]
 
 [tool.uv.sources]
 isaacsim = { index = "nvidia" }
