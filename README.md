@@ -203,6 +203,7 @@ Currently, installing and running the benchmark is only supported in the MuJoCo 
 ### Installing Benchmarks
 
 ```bash
+# Optional — has a default of ~/.cache/molmospaces/assets/<base64url(project_path)>
 export MLSPACES_ASSETS_DIR=/path/to/symlink/resources
 python -m molmo_spaces.molmo_spaces_constants
 ```

@@ -77,14 +77,9 @@ Notes:
 - Must use `uv pip` — the sub-package's `pyproject.toml` uses uv-only features (`override-dependencies`, custom indices for `nvidia` and `torch`/cu130).
 - The `sim` extra pulls in `isaaclab[all,isaacsim]>=2.3.1`, which downloads IsaacSim 5.1.0 + IsaacLab 2.3.1 — multi-GB, slow.
 
-### Gotcha: `flatdict` build fails on modern setuptools
+### Note: `flatdict` build constraint
 
-The Isaac install transitively pulls `flatdict==4.0.1` (via `isaaclab`), which calls `pkg_resources` at build time. Setuptools ≥81 dropped `pkg_resources` from the implicit imports, so the build fails inside uv's isolated build env with `ModuleNotFoundError: No module named 'pkg_resources'`. Fix: pass `--build-constraints` with `setuptools<81`:
-
-```bash
-echo "setuptools<81" > /tmp/build-constraints.txt
-uv pip install -e ".[dev,sim]" --build-constraints /tmp/build-constraints.txt
-```
+The Isaac install transitively pulls `flatdict==4.0.1` (via `isaaclab`), which calls `pkg_resources` at build time. Setuptools ≥81 dropped `pkg_resources` from the implicit imports, so the sdist build fails with `ModuleNotFoundError: No module named 'pkg_resources'`. This is pinned via `[tool.uv] build-constraint-dependencies = ["setuptools<81"]` in `molmo_spaces_isaac/pyproject.toml` — no install-time flag is needed.
 
 ### Isaac-only CLI scripts (only available in `mlspaces-isaac` env)
 
@@ -140,7 +135,10 @@ PYTHONPATH=. pytest mlspaces_tests/data_generation        # full datagen tests
 PYTHONPATH=. pytest mlspaces_tests/data_generation_curobo # requires curobo extra
 PYTHONPATH=. pytest mlspaces_tests/data_generation/test_franka_pick.py::test_name --log-cli-level DEBUG
 
-# Install benchmark assets (downloads to MLSPACES_ASSETS_DIR)
+# Install benchmark assets (downloads to MLSPACES_ASSETS_DIR).
+# Both env vars have defaults — set them only if you want a different location:
+#   MLSPACES_CACHE_DIR   default: ~/.cache/molmo-spaces-resources
+#   MLSPACES_ASSETS_DIR  default: ~/.cache/molmospaces/assets/<base64url(project_path)>
 python -m molmo_spaces.molmo_spaces_constants
 
 # Quick smoke test (no --viewer; mjviewer needs classic OpenGL which the
@@ -308,13 +306,19 @@ Notes:
 
 ## Environment variables
 
-| Variable | Purpose |
-|---|---|
-| `MLSPACES_ASSETS_DIR` | Where downloaded assets live (default `~/.cache/molmospaces/assets/<install-hash>`) |
-| `MLSPACES_FORCE_INSTALL` | Override existing assets (default `True`) |
-| `MLSPACES_PINNED_ASSETS_FILE` | JSON overriding asset versions in `molmo_spaces_constants.py` |
-| `MUJOCO_EGL_DEVICE_ID` | Render device — indices do not match `CUDA_VISIBLE_DEVICES` (see issue #66) |
-| `MUJOCO_GL=egl`, `PYOPENGL_PLATFORM=egl` | Required for headless rendering on Linux |
+All `MLSPACES_*` variables are **optional** — every one has a working default. Set them only to relocate caches or override pins.
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `MLSPACES_CACHE_DIR` | Where downloaded archives are extracted (the "store") | `~/.cache/molmo-spaces-resources` |
+| `MLSPACES_ASSETS_DIR` | Where versioned symlinks are created (the "view" the project reads) | `~/.cache/molmospaces/assets/<base64url(project_path)>` |
+| `MLSPACES_OBJAVERSE_ASSETS_DIR` | Override location for objaverse objects only | `${MLSPACES_ASSETS_DIR}/objects/objaverse` |
+| `MLSPACES_FORCE_INSTALL` | Replace existing symlinks when version pin differs | `True` |
+| `MLSPACES_PINNED_ASSETS_FILE` | JSON merged onto `DATA_TYPE_TO_SOURCE_TO_VERSION` (override versions) | _(unset)_ |
+| `MLSPACES_DOWNLOAD_EXTRACT_ALL_SCENES_OBJECTS_GRASPS` | Bulk-download every scene/object/grasp, not just metadata for large datasets | `False` |
+| `MUJOCO_EGL_DEVICE_ID` | Render device — indices do not match `CUDA_VISIBLE_DEVICES` (see issue #66) | `0` |
+| `MUJOCO_GL=egl`, `PYOPENGL_PLATFORM=egl` | Required for headless rendering on Linux | _(unset)_ |
+| `FILAMENT_OPENGL_HANDLE_ARENA_SIZE_IN_MB` | Filament's GPU-handle arena size. **Does NOT fix the THORMAP segfault** (see Known issues) | `~8` (built-in) |
 
 ## Conventions
 

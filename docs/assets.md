@@ -20,9 +20,10 @@ A number of assets and other resources are provided; this overview explains the 
 To install assets, while on the project root, we can just
 import the `molmo_spaces.molmo_spaces_constants` module, e.g.
 ```bash
-export MLSPACES_CACHE_DIR=~/.cache/molmo-spaces-resources
-export MLSPACES_ASSETS_DIR=/path/to/symlink/resources
-export MLSPACES_FORCE_INSTALL=True
+# All three env vars have defaults — set them only to relocate caches or force a reinstall.
+export MLSPACES_CACHE_DIR=~/.cache/molmo-spaces-resources    # default: ~/.cache/molmo-spaces-resources
+export MLSPACES_ASSETS_DIR=/path/to/symlink/resources        # default: ~/.cache/molmospaces/assets/<base64url(project_path)>
+export MLSPACES_FORCE_INSTALL=True                           # default: True
 python -m molmo_spaces.molmo_spaces_constants
 ```
 which will download and extract data under the `MLSPACES_CACHE_DIR` (and symlink under `MLSPACES_ASSETS_DIR`) the data versions listed in `molmo_spaces.molmo_spaces_constants`, e.g.
@@ -130,9 +131,9 @@ The pinned assets file should have the same structure as `DATA_TYPE_TO_SOURCE_TO
 2. If some data sources are not required for your experiment, it might be worth it to redefine the `DATA_TYPE_TO_SOURCE_TO_VERSION`, which by default installs a pinned version of each available data source, and can take considerable amount of time and storage.
 3. To install all files for scenes, grasps, or objects (e.g. to maintain a cache with all data available to be shared by many users), we can do
 ```bash
-export MLSPACES_CACHE_DIR=/path/to/shared/cache
-export MLSPACES_ASSETS_DIR=/path/to/eg/local/symlink/resources
-export MLSPACES_DOWNLOAD_EXTRACT_ALL_SCENES_OBJECTS_GRASPS=True
+export MLSPACES_CACHE_DIR=/path/to/shared/cache                  # default: ~/.cache/molmo-spaces-resources
+export MLSPACES_ASSETS_DIR=/path/to/eg/local/symlink/resources   # default: ~/.cache/molmospaces/assets/<base64url(project_path)>
+export MLSPACES_DOWNLOAD_EXTRACT_ALL_SCENES_OBJECTS_GRASPS=True  # default: False — set True to bulk-extract every scene/object/grasp
 python -m molmo_spaces.molmo_spaces_constants
 ```
 
