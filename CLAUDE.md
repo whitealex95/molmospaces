@@ -46,6 +46,58 @@ Exactly one of `mujoco` / `mujoco-filament` must be selected. This developer alw
 - `curobo` — CuRobo GPU-accelerated planning (used for RB-Y1 tasks). **Not installed in this developer's profile.** If ever re-added: requires `conda install cuda-toolkit=12.8 ninja cuda-nvcc cuda-cudart-dev`, pre-installing torch with cu128, and exporting `CUDA_HOME=$CONDA_PREFIX`, `CPATH=...`, `TORCH_CUDA_ARCH_LIST="8.9"` before the project install (see README's cuRobo section).
 - `docs` — MkDocs site build tooling (only needed to preview/build the documentation site).
 
+## Isaac sub-package (separate env)
+
+`molmo_spaces_isaac/` is a separate Python package with its own `pyproject.toml` (`molmo-spaces-isaac`), explicitly excluded from the main install (see `pyproject.toml` `[tool.setuptools.packages.find]` exclude list). It provides MJCF→USD asset/house conversion and IsaacSim/IsaacLab integration.
+
+**This developer keeps Isaac in a separate conda env named `mlspaces-isaac`.** Do not install it into the `mlspaces` env — there is an unresolvable torch conflict:
+
+| Env | Torch | CUDA |
+|---|---|---|
+| `mlspaces` (main) | `~=2.7.0` (>=2.7,<2.8) | cu128 |
+| `mlspaces-isaac` | `>=2.9.0` (uv override) | cu130 |
+
+### Install profile (one-time)
+
+```bash
+conda deactivate
+conda env remove -n mlspaces-isaac -y          # if rebuilding
+conda create -n mlspaces-isaac python=3.11 -y
+conda activate mlspaces-isaac
+
+pip install uv
+export VIRTUAL_ENV=$CONDA_PREFIX
+
+cd /home/jkim3662/Projects/molmospaces/molmo_spaces_isaac
+uv pip install -e ".[dev,sim]"
+```
+
+Notes:
+- Must `cd` into `molmo_spaces_isaac/` first — the README is explicit about this.
+- Must use `uv pip` — the sub-package's `pyproject.toml` uses uv-only features (`override-dependencies`, custom indices for `nvidia` and `torch`/cu130).
+- The `sim` extra pulls in `isaaclab[all,isaacsim]>=2.3.1`, which downloads IsaacSim 5.1.0 + IsaacLab 2.3.1 — multi-GB, slow.
+
+### Gotcha: `flatdict` build fails on modern setuptools
+
+The Isaac install transitively pulls `flatdict==4.0.1` (via `isaaclab`), which calls `pkg_resources` at build time. Setuptools ≥81 dropped `pkg_resources` from the implicit imports, so the build fails inside uv's isolated build env with `ModuleNotFoundError: No module named 'pkg_resources'`. Fix: pass `--build-constraints` with `setuptools<81`:
+
+```bash
+echo "setuptools<81" > /tmp/build-constraints.txt
+uv pip install -e ".[dev,sim]" --build-constraints /tmp/build-constraints.txt
+```
+
+### Switching between envs
+
+- `conda activate mlspaces` → MuJoCo + Filament work (datagen, evaluation, benchmarks)
+- `conda activate mlspaces-isaac` → Isaac/USD conversion, IsaacSim/IsaacLab scripts
+
+### Isaac-only CLI scripts (only available in `mlspaces-isaac` env)
+
+- `ms-download --type usd --install-dir assets/usd --assets <dataset>` — fetch USD assets
+- `ms-download --type usd --install-dir assets/usd --scenes <dataset>` — fetch USD scenes
+- `ms-convert-assets` — MJCF → USD asset conversion
+- `ms-convert-houses` — MJCF → USD house conversion
+
 ## Common commands
 
 ```bash
