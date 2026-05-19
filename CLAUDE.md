@@ -8,6 +8,36 @@ MolmoSpaces is a robotics simulation framework for generating manipulation/navig
 
 Python 3.11 only. Linux and macOS supported.
 
+## Working with this codebase — read in-repo docs first
+
+Before answering questions about install steps, asset/resource management, env vars, sub-package usage, or core abstractions, **search the in-repo docs and READMEs first** — most of what users ask is already documented in this repo, and re-deriving it from source code wastes effort (and is more error-prone, as repeated debugging sessions in this conversation have shown).
+
+| Where to look | What you'll find |
+|---|---|
+| `README.md` | Install, optional extras, env-var summary table, asset overview, cuRobo install ordering |
+| `docs/assets.md` | Resource manager, `MLSPACES_*` env-var defaults, bulk vs lazy download (`MLSPACES_DOWNLOAD_EXTRACT_ALL_SCENES_OBJECTS_GRASPS`), symlink layout, per-asset license helper |
+| `docs/concepts.md` | Robot / RobotView / MoveGroup abstractions, Env / Task / TaskSampler lifecycle, timing model |
+| `docs/code_structure.md` | Module-by-module layout |
+| `docs/development.md` | Pre-commit hooks, ruff rules, IDE setup |
+| `docs/evaluation_guide.md`, `molmo_spaces/evaluation/README.md` | Benchmark eval, custom-policy plug-in template, sample episode spec |
+| `docs/data_format.md`, `docs/data_processing.md` | Trajectory file layout |
+| `docs/tutorials/` | Task-shaped walkthroughs (e.g. `add_robot/`) |
+| `molmo_spaces_isaac/README.md`, `molmo_spaces_maniskill/README.md` | Sub-package install + CLI scripts |
+| `mlspaces_tests/README.md` | Test fixture regeneration + upload workflow |
+| `pyproject.toml` | Declared deps, extras, ruff config |
+
+For runtime crashes or unfamiliar errors, also check open GitHub issues — the project's contributors often document workarounds there before they reach the docs:
+
+```bash
+gh issue list --repo allenai/molmospaces            # list all
+gh search issues --repo allenai/molmospaces "<keyword>"
+gh issue view <NUMBER> --repo allenai/molmospaces --comments
+```
+
+(The Filament THORMAP segfault, for example, was diagnosed via `gh issue view 79` in this repo's history.)
+
+**Don't re-derive answers from source code when a doc covers it.** If a doc seems wrong, out of date, or contradicts observed behavior, flag the discrepancy in the response rather than silently working around it.
+
 ## Install
 
 This developer uses **conda** on Ubuntu with an NVIDIA RTX 4090 (sm_89). The conda env is named `mlspaces`. Always use this profile unless the user says otherwise.
