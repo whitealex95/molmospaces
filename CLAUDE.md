@@ -38,7 +38,7 @@ The classic `mujoco` extra does work with plain pip, but this developer wants Fi
 
 ### Available extras
 
-Exactly one of `mujoco` / `mujoco-filament` must be selected. This developer always uses `mujoco-filament` (Filament renderer; installs from local wheel at `bin/wheels/`).
+Exactly one of `mujoco` / `mujoco-filament` must be selected. For the main `mlspaces` env, this developer uses `mujoco-filament` (Filament renderer; installs from local wheel at `bin/wheels/`). A parallel `mlspaces-mujoco` env uses the classic `mujoco` extra — see the section below.
 
 - `dev` — code development (ruff, mypy, pre-commit, pybind11-stubgen, ty)
 - `grasp` — grasp generation pipeline
@@ -86,17 +86,46 @@ echo "setuptools<81" > /tmp/build-constraints.txt
 uv pip install -e ".[dev,sim]" --build-constraints /tmp/build-constraints.txt
 ```
 
-### Switching between envs
-
-- `conda activate mlspaces` → MuJoCo + Filament work (datagen, evaluation, benchmarks)
-- `conda activate mlspaces-isaac` → Isaac/USD conversion, IsaacSim/IsaacLab scripts
-
 ### Isaac-only CLI scripts (only available in `mlspaces-isaac` env)
 
 - `ms-download --type usd --install-dir assets/usd --assets <dataset>` — fetch USD assets
 - `ms-download --type usd --install-dir assets/usd --scenes <dataset>` — fetch USD scenes
 - `ms-convert-assets` — MJCF → USD asset conversion
 - `ms-convert-houses` — MJCF → USD house conversion
+
+## Classic MuJoCo env (no Filament)
+
+`mlspaces-mujoco` is a parallel env that installs the same `molmo-spaces` package as `mlspaces` but selects the classic `mujoco` extra instead of `mujoco-filament`. Use it for workflows that hit the Filament arena overflow (see Known issues) or that otherwise need the stock PyPI MuJoCo wheel rather than the custom Filament-bundled build.
+
+| Env | mujoco wheel | Renderer |
+|---|---|---|
+| `mlspaces` (main) | 3.7.1 (custom Filament build, `bin/wheels/`) | Filament + OpenGL |
+| `mlspaces-mujoco` | 3.5.0 (stock PyPI) | OpenGL only |
+
+### Install profile (one-time)
+
+```bash
+conda deactivate
+conda env remove -n mlspaces-mujoco -y          # if rebuilding
+conda create -n mlspaces-mujoco python=3.11 -y
+conda activate mlspaces-mujoco
+
+# Classic `mujoco` extra has no ${PROJECT_ROOT} substitution — plain pip works.
+# tyro is an undeclared dep of scripts/data/generate_maps.py; install it too.
+pip install -e ".[mujoco,dev,housegen]" tyro
+
+pre-commit install
+```
+
+Notes:
+- No `uv` dance required (only `mujoco-filament` needs it).
+- The renderer fallback note in Known issues — "fall back to the classic `mujoco` extra for that workflow" — means activating `mlspaces-mujoco`.
+
+## Switching between envs
+
+- `conda activate mlspaces` → MuJoCo + Filament work (datagen, evaluation, benchmarks; default)
+- `conda activate mlspaces-mujoco` → same workflows but with stock MuJoCo + OpenGL renderer
+- `conda activate mlspaces-isaac` → Isaac/USD conversion, IsaacSim/IsaacLab scripts
 
 ## Common commands
 
@@ -114,8 +143,10 @@ PYTHONPATH=. pytest mlspaces_tests/data_generation/test_franka_pick.py::test_nam
 # Install benchmark assets (downloads to MLSPACES_ASSETS_DIR)
 python -m molmo_spaces.molmo_spaces_constants
 
-# Quick smoke test (Linux). On macOS replace `python` with `mjpython`.
-python scripts/datagen/run_pipeline.py --viewer --seed 3
+# Quick smoke test (no --viewer; mjviewer needs classic OpenGL which the
+# Filament wheel lacks — see Known issues). Pre-generate maps once from
+# `mlspaces-mujoco` if the THORMAP segfault hits.
+python scripts/datagen/run_pipeline.py --seed 3
 
 # Pre-commit hooks
 pre-commit install
@@ -197,6 +228,46 @@ A **benchmark** is a `benchmark.json` containing self-contained episode specs (s
 - `molmo_spaces/policy/solvers/` — scripted planner-based policies (one of the primary action sources for datagen).
 - `molmo_spaces/renderer/` — OpenGL and Filament backends; Filament requires the `mujoco-filament` extra.
 - `molmo_spaces/env/arena/randomization/` — lighting/texture/dynamics domain randomization.
+
+## Known issues
+
+### Filament wheel + THORMAP scenes → segfault unless `_map.png` is precomputed
+
+Tracked upstream: https://github.com/allenai/molmospaces/issues/79
+
+When the Filament-wheel `mlspaces` env runs a pipeline that loads a THORMAP/iTHOR/procthor/holodeck scene, the worker segfaults during scene setup with a misleading message:
+
+```
+PanicLog in allocateHandleSlow:136
+reason: HandleAllocator arena is full, using slower system heap.
+  Please increase the appropriate constant (e.g. FILAMENT_OPENGL_HANDLE_ARENA_SIZE_IN_MB).
+... Segmentation fault (core dumped)
+```
+
+**Don't be fooled** — bumping `FILAMENT_OPENGL_HANDLE_ARENA_SIZE_IN_MB` does NOT help. The arena message is from a second renderer that gets spun up to compute the scene's occupancy map (`get_thormap` in `molmo_spaces/env/env.py:690`). The custom Filament-built MuJoCo wheel **does not include the classic OpenGL renderer at all**, so any code path requesting a renderer goes through Filament, and the second Filament init crashes regardless of arena size. The `use_filament` flag in Python (e.g. in `ProcTHORMap.from_mj_model_path`) is effectively a no-op for this wheel.
+
+`get_thormap` short-circuits the renderer if a precomputed `<scene_stem>_map.png` already exists next to the scene XML — so the fix is to pre-generate those maps in the **`mlspaces-mujoco`** env (classic OpenGL renderer), then run the actual workflow from `mlspaces` (Filament).
+
+**Workflow:**
+
+```bash
+# 1. Generate the maps once, using the classic-mujoco env
+conda activate mlspaces-mujoco
+SCENES_DIR=$(python -c "from molmo_spaces.molmo_spaces_constants import ASSETS_DIR; print(ASSETS_DIR / 'scenes')")
+PYTHONPATH=. python scripts/data/generate_maps.py --dataset ithor             --split train --scenes-dir "$SCENES_DIR"
+PYTHONPATH=. python scripts/data/generate_maps.py --dataset procthor-10k      --split train --scenes-dir "$SCENES_DIR"
+# (repeat --dataset / --split for other datasets you'll hit; only present XML files get processed)
+
+# 2. Switch back to mlspaces (Filament) and run normally
+conda activate mlspaces
+python scripts/datagen/run_pipeline.py --seed 3
+```
+
+Notes:
+- `scripts/data/generate_maps.py` uses `tyro`, which **is not declared** as a main-package dep — `pip install tyro` in the `mlspaces-mujoco` env if missing.
+- Maps land in the shared asset cache (`~/.cache/molmospaces/.../scenes/<dataset>/`) so both envs see them.
+- Drop the `--viewer` flag — `mjviewer` requires the classic OpenGL renderer that the Filament wheel lacks, so `--viewer` always crashes with the Filament wheel even after maps are precomputed.
+- The "leaked semaphore objects" warning that follows the segfault is downstream (multiprocessing workers torn down after the crash), not a separate bug.
 
 ## Environment variables
 
