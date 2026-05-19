@@ -12,9 +12,9 @@ Python 3.11 only. Linux and macOS supported.
 
 This developer uses **conda** on Ubuntu with an NVIDIA RTX 4090 (sm_89). The conda env is named `mlspaces`. Always use this profile unless the user says otherwise.
 
-### Preferred install profile (Ubuntu + RTX 4090, with filament + dev + housegen + curobo)
+### Preferred install profile (Ubuntu + RTX 4090, filament + dev + housegen)
 
-Order matters: CUDA toolkit and torch must be installed **before** the project, because curobo compiles against the installed torch.
+This developer uses the **Filament renderer** and does **not** install `curobo`. Do not add `curobo` to the install command or introduce its prerequisites (CUDA toolkit, pre-installed torch, `TORCH_CUDA_ARCH_LIST`/`CUDA_HOME`/`CPATH` exports) unless explicitly asked.
 
 ```bash
 conda deactivate
@@ -22,34 +22,29 @@ conda env remove -n mlspaces -y                    # if rebuilding from scratch
 conda create -n mlspaces python=3.11 -y
 conda activate mlspaces
 
-# CUDA toolkit + build deps required to compile curobo
-conda install -c conda-forge cuda-toolkit=12.8 ninja evdev cuda-nvcc cuda-cudart-dev -y
+# `mujoco-filament` requires uv (see gotcha below). Install uv into the env.
+pip install uv
+export VIRTUAL_ENV=$CONDA_PREFIX
+uv pip install -e ".[mujoco-filament,dev,housegen]"
 
-# Torch with cu128 BEFORE the project (ignore warnings after this step)
-pip install "torch~=2.7.0" "torchvision>=0.22.0,<0.23.0" --index-url https://download.pytorch.org/whl/cu128
-
-# Build env vars for the project install
-export CUDA_HOME=$CONDA_PREFIX
-export CPATH=$(dirname $(find $CONDA_PREFIX -name "cuda_runtime_api.h" | head -1)):$CPATH
-export TORCH_CUDA_ARCH_LIST="8.9"   # RTX 4090 = sm_89
-
-pip install -e ".[mujoco-filament,dev,housegen,curobo]"
 pre-commit install
 ```
 
-curobo's native compile is slow (several minutes); do not interrupt it.
+### Gotcha: `mujoco-filament` requires `uv`
+
+`pyproject.toml`'s `mujoco-filament` extra contains `mujoco @ file://${PROJECT_ROOT}/bin/wheels/...`. `${PROJECT_ROOT}` is a uv-specific substitution; plain `pip` errors with `ValueError: non-local file URIs are not supported`. The fix is to install `uv` inside the conda env and run `uv pip install` — as shown in the profile above. Setting `VIRTUAL_ENV=$CONDA_PREFIX` tells `uv` to target the active conda env.
+
+The classic `mujoco` extra does work with plain pip, but this developer wants Filament — do not silently swap to `mujoco`.
 
 ### Available extras
 
-Exactly one of `mujoco` / `mujoco-filament` must be selected. This developer uses `mujoco-filament` (Filament renderer; installs from local wheel at `bin/wheels/`).
+Exactly one of `mujoco` / `mujoco-filament` must be selected. This developer always uses `mujoco-filament` (Filament renderer; installs from local wheel at `bin/wheels/`).
 
 - `dev` — code development (ruff, mypy, pre-commit, pybind11-stubgen, ty)
 - `grasp` — grasp generation pipeline
 - `housegen` — house generation pipeline from iTHOR, ProcTHOR, or Holodeck JSONs
-- `curobo` — CuRobo GPU-accelerated planning (used for RB-Y1 tasks; requires the CUDA/torch ordering shown above)
-- `docs` — MkDocs site build tooling (only needed to preview/build the documentation site)
-
-To install multiple extras at once: `pip install -e ".[mujoco-filament,dev,housegen]"`. curobo is the only extra that needs special install ordering.
+- `curobo` — CuRobo GPU-accelerated planning (used for RB-Y1 tasks). **Not installed in this developer's profile.** If ever re-added: requires `conda install cuda-toolkit=12.8 ninja cuda-nvcc cuda-cudart-dev`, pre-installing torch with cu128, and exporting `CUDA_HOME=$CONDA_PREFIX`, `CPATH=...`, `TORCH_CUDA_ARCH_LIST="8.9"` before the project install (see README's cuRobo section).
+- `docs` — MkDocs site build tooling (only needed to preview/build the documentation site).
 
 ## Common commands
 
