@@ -154,6 +154,43 @@ pre-commit install
 
 Data-generation tests under `mlspaces_tests/data_generation*` compare against versioned fixture archives pinned in `molmo_spaces/molmo_spaces_constants.py` under `test_data`. Regenerating fixtures involves running the `generate_test_data_*.py` scripts, uploading with `mjt_upload`, and bumping the version string — see `mlspaces_tests/README.md`.
 
+## Visualizing a scene
+
+**Always use `mlspaces-mujoco`** for any MuJoCo viewer workflow. The Filament-built wheel in `mlspaces` is missing the classic OpenGL UI symbols (`mjui_update`, etc.), so every viewer entry point — `python -m mujoco.viewer`, `mujoco.viewer.launch()`, `mujoco.viewer.launch_passive()`, and the `--viewer` flag of `run_pipeline.py` — fails with `ImportError: undefined symbol: mjui_update` in `mlspaces`. There is no env-var workaround.
+
+```bash
+conda activate mlspaces-mujoco
+```
+
+### Just look at a scene XML (no project code)
+
+```bash
+python -m mujoco.viewer --mjcf /path/to/scene.xml
+```
+
+Use this for raw MJCF inspection. Interactive: mouse to orbit, Ctrl+drag to manipulate joints, `w` for wireframe, spacebar to pause. Won't load lazily-fetched meshes/textures the project's resource manager would normally download — point it at scenes already on disk under `${MLSPACES_ASSETS_DIR}/scenes/`.
+
+### Full project pipeline with viewer (robot + cameras + task)
+
+```bash
+python scripts/datagen/run_pipeline.py --viewer --seed 3
+```
+
+This is the `--viewer` flag that fails from `mlspaces` — works from `mlspaces-mujoco` because of the classic renderer. Adds the robot, cameras, and policy execution on top of the scene. Pre-generated `_map.png` files are not required here (the classic renderer can compute occupancy on the fly), but they speed up startup.
+
+### Programmatic (REPL / scripts)
+
+```python
+import mujoco, mujoco.viewer
+model = mujoco.MjModel.from_xml_path("/path/to/scene.xml")
+data = mujoco.MjData(model)
+mujoco.viewer.launch(model, data)              # blocking, modal
+# or for non-blocking driven from Python:
+viewer = mujoco.viewer.launch_passive(model, data)
+```
+
+`launch_passive` is what `run_pipeline.py --viewer` uses internally — your code keeps stepping `mj_step` while the viewer renders in another thread.
+
 ## Three entry points
 
 ```
