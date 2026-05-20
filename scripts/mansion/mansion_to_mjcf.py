@@ -5,8 +5,8 @@ coverage (85/85 unique assetIds for `floor_1.json`), but emits MJCF for
 loading in MuJoCo (`mlspaces-mujoco` env).
 
 v1 scope (visual only, no physics):
-- Floors as fan-triangulated polygon meshes (one per room)
-- Walls as fan-triangulated polygon meshes (one per wall)
+- Floors as ear-clip triangulated polygon meshes (one per room; concave-safe)
+- Walls as triangulated polygon meshes (one per wall)
 - Objects (objathor `.pkl.gz` / mansion_patch `.json` / molmospaces THOR `.xml`)
   placed at their Unity pose
 - All geoms have ``contype=0 conaffinity=0`` (visual only — no collisions)
@@ -497,8 +497,91 @@ def _safe_mjcf_name(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _fan_triangulate(n: int) -> list[tuple[int, int, int]]:
-    return [(0, i, i + 1) for i in range(1, n - 1)]
+def _triangulate_polygon(
+    pts: list[tuple[float, float, float]],
+) -> list[tuple[int, int, int]]:
+    """Ear-clipping triangulation of a simple, possibly concave, planar polygon.
+
+    Returns 0-based ``(i, j, k)`` index triples wound in the polygon's vertex
+    order. Correct for concave rooms (e.g. L-shaped floors); a fan would spill
+    triangles across the concave notch and fill the convex hull instead.
+
+    Raises ``ValueError`` if the polygon is degenerate or self-intersecting: a
+    non-simple polygon has no valid triangulation, so the caller skips and logs
+    it rather than emit a silently-wrong mesh.
+    """
+    n = len(pts)
+    if n < 3:
+        return []
+    if n == 3:
+        return [(0, 1, 2)]
+
+    # Project onto the polygon's plane: Newell's normal -> drop the dominant
+    # axis. Handles horizontal floors and vertical walls alike.
+    nx = ny = nz = 0.0
+    for i in range(n):
+        cx, cy, cz = pts[i]
+        ax, ay, az = pts[(i + 1) % n]
+        nx += (cy - ay) * (cz + az)
+        ny += (cz - az) * (cx + ax)
+        nz += (cx - ax) * (cy + ay)
+    drop = max(range(3), key=lambda k: abs((nx, ny, nz)[k]))
+    u, v = (k for k in range(3) if k != drop)
+    p2 = [(pt[u], pt[v]) for pt in pts]
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    signed = sum(
+        p2[i][0] * p2[(i + 1) % n][1] - p2[(i + 1) % n][0] * p2[i][1]
+        for i in range(n)
+    )
+    ccw = signed > 0.0
+
+    def is_convex(a, b, c):
+        cr = cross(p2[a], p2[b], p2[c])
+        return cr > 0.0 if ccw else cr < 0.0
+
+    def in_triangle(p, a, b, c):
+        d1 = cross(p2[a], p2[b], p2[p])
+        d2 = cross(p2[b], p2[c], p2[p])
+        d3 = cross(p2[c], p2[a], p2[p])
+        neg = d1 < 0.0 or d2 < 0.0 or d3 < 0.0
+        pos = d1 > 0.0 or d2 > 0.0 or d3 > 0.0
+        return not (neg and pos)
+
+    remaining = list(range(n))
+    tris: list[tuple[int, int, int]] = []
+    guard = 0
+    while len(remaining) > 3 and guard < n * n:
+        guard += 1
+        m = len(remaining)
+        clipped = False
+        for k in range(m):
+            a = remaining[(k - 1) % m]
+            b = remaining[k]
+            c = remaining[(k + 1) % m]
+            if not is_convex(a, b, c):
+                continue
+            if any(j not in (a, b, c) and in_triangle(j, a, b, c) for j in remaining):
+                continue
+            tris.append((a, b, c))
+            remaining.pop(k)
+            clipped = True
+            break
+        if not clipped:
+            break
+
+    if len(remaining) == 3:
+        tris.append((remaining[0], remaining[1], remaining[2]))
+
+    if len(tris) != n - 2:
+        raise ValueError(
+            f"cannot triangulate polygon (n={n}): not a simple polygon "
+            f"(self-intersecting or degenerate) — ear clipping produced "
+            f"{len(tris)} of {n - 2} triangles"
+        )
+    return tris
 
 
 def write_polygon_obj(
@@ -507,7 +590,7 @@ def write_polygon_obj(
     pts = _dicts_to_xyz(polygon)
     if len(pts) < 3:
         raise ValueError("polygon < 3 points")
-    tris = _fan_triangulate(len(pts))
+    tris = _triangulate_polygon(pts)
     write_obj(out_path, pts, tris)
 
 
@@ -1017,8 +1100,11 @@ def convert(
 
     lines: list[str] = []
     lines.append(f'<mujoco model="mansion_{_safe_mjcf_name(scene_json.stem)}">')
+    # balanceinertia: flat (planar) room/wall meshes have a degenerate inertia
+    # where A+B == C; floating-point rounding can tip it to A+B < C and fail the
+    # compile. The scene is visual-only, so balancing these inertias is harmless.
     lines.append('  <compiler angle="degree" autolimits="true" '
-                 'meshdir="assets" texturedir="assets"/>')
+                 'balanceinertia="true" meshdir="assets" texturedir="assets"/>')
     lines.append('  <option gravity="0 0 -9.81"/>')
     lines.append('  <visual>')
     lines.append('    <headlight diffuse="0.55 0.55 0.55" '
