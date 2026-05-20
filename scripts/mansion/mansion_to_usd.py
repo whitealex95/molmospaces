@@ -709,9 +709,16 @@ def convert(
 
     world = UsdGeom.Xform.Define(stage, "/World")
     stage.SetDefaultPrim(world.GetPrim())
-    # Rotate the entire scene so Unity's +y (up) becomes USD's +z (up).
-    rot_op = world.AddXformOp(UsdGeom.XformOp.TypeRotateX, UsdGeom.XformOp.PrecisionDouble)
-    rot_op.Set(90.0)
+    # Convert Unity (left-handed, y-up) -> USD (right-handed, z-up) with the
+    # y<->z swap M: (x,y,z) -> (x,z,y). A swap is a reflection (det -1), which
+    # is *required* to fix handedness -- the old RotateX(90) is a pure rotation,
+    # so it fixed only the up-axis and left the whole scene mirrored. USD
+    # xformOp:transform accepts a reflection matrix directly, so a single root
+    # op converts everything; geometry inside /World stays in raw Unity coords.
+    xform_op = world.AddXformOp(
+        UsdGeom.XformOp.TypeTransform, UsdGeom.XformOp.PrecisionDouble
+    )
+    xform_op.Set(Gf.Matrix4d(1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1))
 
     report = ConversionReport(
         scene_json=str(scene_json),

@@ -167,12 +167,31 @@ The script writes every skipped asset to `conversion_report.json`.
 
 ### Coordinate convention
 
-Mansion JSON uses Unity (`+y` up). MuJoCo uses `+z` up. The converter
-wraps everything in `<body name="scene_root" euler="90 0 0">`, so:
-- Inside `scene_root` everything is stored in raw Unity coords
-- The root's `euler="90 0 0"` rotates Unity's `+y` up to MuJoCo's `+z` up
-- Per-instance `euler="0 rotY 0"` is in the scene_root frame (= Unity frame),
-  so the JSON's `rotation.y` works directly without conversion
+Mansion JSON uses **Unity** (left-handed, `+y` up); MuJoCo is **right-handed,
+`+z` up**. The conversion is the y↔z swap
+
+    M: (x, y, z) -> (x, z, y)
+
+which matches procthor's `unity_to_mj_pos`. M is a **reflection** (det -1),
+and a reflection is *required*: converting left-handed Unity to right-handed
+MuJoCo cannot be done with a rotation — a pure rotation fixes only the
+up-axis and leaves the whole scene mirrored (see bug log §M).
+
+A MuJoCo geom/body transform cannot encode a reflection, so M is baked in
+decomposed form, `M = ROT90X ∘ DIAG` with `DIAG = diag(1, 1, -1)`:
+
+- Every `<mesh>` gets `scale="1 1 -1"` (the DIAG half — MuJoCo reflects the
+  mesh and its normals natively for a negative-scale axis).
+- Room / wall geoms keep raw Unity world-coord verts in their `.obj`; the
+  `rooms` and `walls` bodies carry `euler="90 0 0"` (the ROT90X half), and
+  `ROT90X ∘ DIAG = M`.
+- Placed objects: the body `pos` / `quat` are baked via `unity_to_mj_pos`
+  and `unity_to_mj_quat` (`R_mj = M @ R_unity @ DIAG`).
+- THOR-asset per-geom bindings are reflected by DIAG-conjugation
+  (`reflect_nested_pos` / `reflect_nested_quat`).
+
+`scene_root` is now just a plain grouping container — there is no
+scene-wide rotation node.
 
 ### Anchor offset for objathor / patched assets
 
@@ -267,6 +286,31 @@ This handles the inconsistent wall polygon ordering in the dataset
 
 A running record of issues hit while iterating on this converter. Future
 sessions: read this BEFORE debugging similar-looking problems.
+
+### M. Whole scene mirrored — rotation used where a reflection was needed
+
+**Symptom:** mansion MJCF (and USD) scenes were left-right mirror images of
+the source layout. Internally consistent, but flipped relative to procthor
+scenes and to reality — easy to miss without an asymmetric reference.
+
+**Cause:** Unity is left-handed; MuJoCo and z-up USD are right-handed.
+Converting left- to right-handed *requires* an orientation-reversing
+transform (a reflection, det -1). Both converters used a pure **rotation** —
+MJCF `scene_root euler="90 0 0"`, USD `/World` `RotateX 90` — which fixes the
+up-axis but preserves handedness, so every scene came out mirrored. A body or
+xform rotation node can never fix this: rotations are det +1 by definition.
+
+**Fix:** bake the y↔z swap `M: (x,y,z) -> (x,z,y)` (a reflection, matching
+procthor's `unity_to_mj_pos`) into the geometry. MJCF: `M = ROT90X ∘
+diag(1,1,-1)` — `diag` on every `<mesh scale>`, `ROT90X` on the `rooms` /
+`walls` bodies, object and THOR placements baked via `unity_to_mj_pos` /
+`unity_to_mj_quat` / `reflect_nested_*`; the `scene_root euler` is removed.
+USD: `/World` carries an `xformOp:transform` set to the M matrix (USD accepts
+a reflection directly); geometry inside stays raw Unity. See the "Coordinate
+convention" section above.
+
+**Verified:** every room floor vertex lands at exactly `M(unity_json_vertex)`
+— 7/7 rooms in both MJCF and USD — not the mirrored `(x,-z,y)`.
 
 ### A. Objects floating ~½ object-height above the floor
 

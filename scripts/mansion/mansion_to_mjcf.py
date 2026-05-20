@@ -37,9 +37,68 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+from scipy.spatial.transform import Rotation
+
 LOG = logging.getLogger("mansion_to_mjcf")
 
 OBJATHOR_UID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+# ---------------------------------------------------------------------------
+# Unity -> MuJoCo coordinate conversion
+# ---------------------------------------------------------------------------
+# Unity is left-handed (y-up); MuJoCo is right-handed (z-up). The conversion is
+# the y<->z swap  M: (x, y, z) -> (x, z, y).  A swap is a reflection (det -1),
+# and a reflection is *required* -- a pure rotation cannot change handedness,
+# which is why the old `scene_root euler="90 0 0"` left scenes mirrored. M
+# matches molmo_spaces.housegen.utils.unity_to_mj_pos (the procthor convention).
+#
+# A MuJoCo geom/body transform cannot encode a reflection, so M is split as
+#     M = ROT90X @ DIAG        with DIAG = diag(1, 1, -1)
+# DIAG is carried by each <mesh>'s `scale` (MuJoCo reflects mesh + normals
+# natively); ROT90X folds into body/geom rotations.
+
+_M = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]])
+_DIAG = np.diag([1.0, 1.0, -1.0])
+MESH_SCALE = "1 1 -1"  # the DIAG half of M; emitted on every <mesh>
+
+
+def unity_to_mj_pos(x: float, y: float, z: float) -> tuple[float, float, float]:
+    """Unity position -> MuJoCo position (the y<->z swap)."""
+    return (x, z, y)
+
+
+def unity_to_mj_quat(
+    rx: float, ry: float, rz: float
+) -> tuple[float, float, float, float]:
+    """MuJoCo body quat (w, x, y, z) for an object whose Unity orientation is
+    the intrinsic-XYZ euler ``(rx, ry, rz)`` in degrees.
+
+    The mesh carries DIAG via its `scale`, so the body rotation absorbs the
+    matching DIAG together with M:  ``R_mj = M @ R_unity @ DIAG``  (det +1, a
+    proper rotation).
+    """
+    r_u = Rotation.from_euler("XYZ", (rx, ry, rz), degrees=True).as_matrix()
+    return tuple(Rotation.from_matrix(_M @ r_u @ _DIAG).as_quat(scalar_first=True))
+
+
+def reflect_nested_pos(
+    p: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Reflect a position nested inside an already-converted body (e.g. a THOR
+    asset's per-geom binding): conjugation by DIAG, i.e. negate z."""
+    return (p[0], p[1], -p[2])
+
+
+def reflect_nested_quat(
+    q: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """Conjugate a nested rotation by DIAG (``DIAG @ R @ DIAG``). Input and
+    output quats are MuJoCo order (w, x, y, z)."""
+    w, x, y, z = q
+    m = Rotation.from_quat((x, y, z, w)).as_matrix()
+    return tuple(Rotation.from_matrix(_DIAG @ m @ _DIAG).as_quat(scalar_first=True))
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +461,10 @@ def bake_thor_mjcf(
             g_quat = _parse_quat(g.get("quat"))
             geom_pos, geom_quat = _compose_transform(cum_pos, cum_quat,
                                                       g_pos, g_quat)
+            # This binding sits inside the (already handedness-converted)
+            # instance body, so reflect it by DIAG-conjugation.
+            geom_pos = reflect_nested_pos(geom_pos)
+            geom_quat = reflect_nested_quat(geom_quat)
 
             binding: dict[str, str] = {"mesh": mesh_name_map[old_mesh]}
             old_mat = g.get("material")
@@ -1133,8 +1196,11 @@ def convert(
                 continue
             seen_mat.add(name)
             lines.append(f'    <material name="{_xml_escape(name)}" {_format_attrs(attrs)}/>')
-    # asset meshes — inertia="shell" so MuJoCo doesn't reject thin / non-watertight
-    # meshes during the volume-based inertia computation (we're visual-only anyway).
+    # Every <mesh> gets scale="1 1 -1" (MESH_SCALE) -- the DIAG half of the
+    # Unity->MuJoCo handedness conversion M (see the conversion section above).
+    # MuJoCo natively reflects the mesh and its normals for a negative scale.
+    # inertia="shell" keeps MuJoCo from rejecting thin / zero-volume meshes
+    # during inertia computation (the scene is visual-only anyway).
     seen_mesh: set[str] = set()
     for ba in baked.values():
         for name, relfile in ba.meshes:
@@ -1142,25 +1208,30 @@ def convert(
                 continue
             seen_mesh.add(name)
             lines.append(f'    <mesh name="{_xml_escape(name)}" '
-                         f'file="{_xml_escape(relfile)}" inertia="shell"/>')
-    # room/wall meshes (flat polygons — inertia="shell" is required, they have zero volume)
+                         f'file="{_xml_escape(relfile)}" '
+                         f'scale="{MESH_SCALE}" inertia="shell"/>')
     for name, relfile in room_meshes:
         lines.append(f'    <mesh name="{_xml_escape(name)}" '
-                     f'file="{_xml_escape(relfile)}" inertia="shell"/>')
+                     f'file="{_xml_escape(relfile)}" '
+                     f'scale="{MESH_SCALE}" inertia="shell"/>')
     for name, relfile in wall_meshes:
         lines.append(f'    <mesh name="{_xml_escape(name)}" '
-                     f'file="{_xml_escape(relfile)}" inertia="shell"/>')
+                     f'file="{_xml_escape(relfile)}" '
+                     f'scale="{MESH_SCALE}" inertia="shell"/>')
     lines.append('  </asset>')
 
     # --- worldbody
     lines.append('  <worldbody>')
     lines.append('    <light pos="0 0 8" dir="0 0 -1" '
                  'diffuse="0.7 0.7 0.7" specular="0.05 0.05 0.05"/>')
-    # Unity y-up → MuJoCo z-up: rotate root +90° about x
-    lines.append('    <body name="scene_root" euler="90 0 0">')
+    # scene_root is a plain grouping container -- the Unity→MuJoCo conversion is
+    # baked per element (mesh scale + body/geom rotations), not via a root node.
+    lines.append('    <body name="scene_root">')
 
-    # rooms
-    lines.append('      <body name="rooms">')
+    # rooms / walls: .obj verts are raw Unity world coords. euler="90 0 0" is
+    # the ROT90X half of M; the mesh scale="1 1 -1" supplies the DIAG half, so
+    # ROT90X ∘ DIAG = M converts each vertex to MuJoCo coords.
+    lines.append('      <body name="rooms" euler="90 0 0">')
     for name, _ in room_meshes:
         lines.append(f'        <geom name="{_xml_escape(name)}" type="mesh" '
                      f'mesh="{_xml_escape(name)}" rgba="0.85 0.82 0.78 1" '
@@ -1169,7 +1240,7 @@ def convert(
     lines.append('      </body>')
 
     # walls
-    lines.append('      <body name="walls">')
+    lines.append('      <body name="walls" euler="90 0 0">')
     for name, _ in wall_meshes:
         lines.append(f'        <geom name="{_xml_escape(name)}" type="mesh" '
                      f'mesh="{_xml_escape(name)}" rgba="0.92 0.92 0.92 1" '
@@ -1233,10 +1304,14 @@ def convert(
         z -= rot_oz
 
         body_name = _safe_mjcf_name(f"{category}__{aid}__{idx}")
-        # MuJoCo body euler is intrinsic XYZ in compiler angle="degree"
+        # (x,y,z)/(rx,ry,rz) above are the body's Unity-frame pose; convert it
+        # to MuJoCo -- the handedness reflection M, baked into pos + quat.
+        mx, my, mz = unity_to_mj_pos(x, y, z)
+        qw, qx, qy, qz = unity_to_mj_quat(rx, ry, rz)
         lines.append(
             f'        <body name="{_xml_escape(body_name)}" '
-            f'pos="{x:.6f} {y:.6f} {z:.6f}" euler="{rx:.6f} {ry:.6f} {rz:.6f}">'
+            f'pos="{mx:.6f} {my:.6f} {mz:.6f}" '
+            f'quat="{qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f}">'
         )
         for i, g in enumerate(ba.geoms):
             gname = _safe_mjcf_name(f"{body_name}_g{i}")

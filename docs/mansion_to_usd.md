@@ -198,17 +198,18 @@ or `setup_mansion.py` didn't install a patched asset folder you need.
 
 ### Coordinate convention
 
-Mansion JSON uses **Unity** (`+y` up, left-handed-ish for AI2-THOR).
-USD/IsaacSim default is **`+z` up**. The converter applies:
+Mansion JSON uses **Unity** (left-handed, `+y` up); USD / IsaacSim is
+**right-handed, `+z` up**. The conversion is the y↔z swap
 
-```
-usd_xyz = (unity.x, unity.z, unity.y)
-usd_rotZ = unity.rotY     # rotation about the up axis maps directly
-```
+    M: (x, y, z) -> (x, z, y)
 
-Object meshes from objathor `.pkl.gz` are stored in Unity coords; the script
-swaps axes during the bake step, so the per-asset `<uid>.usda` is already
-USD-native.
+a **reflection** (det -1) — required to convert left-handed Unity to
+right-handed USD. A pure rotation (the old `RotateX 90`) only fixes the
+up-axis and leaves the scene mirrored — see `docs/mansion_to_mjcf.md` §M.
+
+The converter applies M once, as an `xformOp:transform` on `/World` (USD
+accepts a reflection matrix directly). A single root op converts the whole
+scene; all geometry and placements inside `/World` stay in raw Unity coords.
 
 ---
 
@@ -305,21 +306,20 @@ door/window world position matches mansion's segment midpoint to 5
 decimal places (max Δ = 0.00000 m, n=20). Wall cutout count = 40/82,
 identical to the MJCF output.
 
-### Visual validation (not yet done in this session)
+### Visual validation
 
-The conversion produced a syntactically valid USDA (1829 prims, 164 references
-all resolve on disk, `pxr.Usd.Stage.Open` succeeds) but it has not yet been
-opened in IsaacSim to confirm the visual result matches `floor_1.png`. If
-something looks off when you do, the most likely culprits in v1 order:
+The conversion produces a syntactically valid USDA (`pxr.Usd.Stage.Open`
+succeeds, references resolve) and the geometry is numerically verified: every
+room floor vertex lands at `M(unity_json_vertex)` (7/7 rooms). It has not been
+opened in IsaacSim to confirm the rendered result. If something looks off:
 
-1. Concave floor polygons rendering as overlapping triangles → switch to
-   explicit triangulation in `_add_polygon_mesh`.
-2. Z-up rotation looks wrong → adjust the world-level `rotateX=90` (try
-   `-90`, or replace with `rotateZ`/`rotateY` depending on the IsaacSim
-   stage orientation you target).
-3. Object instances appear upside-down or flipped → some objathor assets
-   have a non-zero `yRotOffset` we currently ignore. Apply it after the
-   per-instance `rotateY`.
+1. ~~Concave floor polygons render as overlapping triangles~~ — **fixed**:
+   `_add_polygon_mesh` ear-clips the polygon (`_triangulate_polygon`).
+2. ~~Z-up / handedness wrong~~ — **fixed**: `/World` applies the reflection
+   `M` (see "Coordinate convention" and `docs/mansion_to_mjcf.md` §M). If
+   faces render inside-out, that is a winding/normals interaction with the
+   reflecting root transform — set the mesh `orientation` or flip normals.
+3. Object instances upside-down / flipped → check `yRotOffset` handling.
 
 ---
 
