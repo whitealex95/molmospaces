@@ -26,9 +26,10 @@ gen_trajectories.py orchestrates occupancy→plan→run_mujoco for N trajectorie
 | Script | Role |
 |---|---|
 | `build_occupancy.py` | scene MJCF → 2D occupancy + room-label grid |
+| `build_occupancy_usd.py` | scene **USD** → the same grid (for scenes whose MJCF won't compile) |
 | `plan.py` | occupancy grid → clearance-aware A* path; reusable `Planner` class |
 | `run_mujoco.py` | scene + path → kinematic G1 + egocentric/chase render (MuJoCo) |
-| `run_isaac.py` | USD scene + path → egocentric camera render (IsaacSim) |
+| `run_isaac.py` | USD scene + path → G1 egocentric RGB+depth + chase render (IsaacSim) |
 | `gen_trajectories.py` | batch driver: N trajectories/scene, previews + index |
 
 The stages are **sim-agnostic by design**: the occupancy grid and the A* path
@@ -84,6 +85,18 @@ Scene MJCF → `occupancy.npz` (a robot-agnostic 2D occupancy + room grid).
 
 The stored occupancy is **raw** — agent-radius clearance is *not* baked in; it
 is applied later, at planning time, so one grid serves any robot radius.
+
+### Stage 1 (USD) — `build_occupancy_usd.py`
+
+Some procthor-objaverse scenes have an incomplete MJCF (the objaverse MJCF
+object library is a partial subset, so a missing object breaks compilation)
+but a complete USD. `build_occupancy_usd.py` builds the *same* `occupancy.npz`
+straight from the USD geometry: it reads the scene's `Geometry` scope, then
+rasterizes the `room_N_visual_0` floor meshes (free + room id), the
+`wall_*_visual_0` wall meshes (obstacle), the furniture/decor Xform bboxes
+(obstacle), and carves the `doorway_*` footprints back open. Pure
+`pxr` + numpy + cv2 — no render. Run it in the `mlspaces-isaac` env; the
+output is byte-compatible, so `plan.py` and `run_isaac.py` are unchanged.
 
 ## Stage 2 — `plan.py` / `Planner`
 
