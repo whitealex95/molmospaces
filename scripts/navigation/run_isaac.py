@@ -36,7 +36,6 @@ ap.add_argument("--scene", required=True, help="USD scene (.usd/.usda)")
 ap.add_argument("--path", required=True, help="path.npz from plan.py")
 ap.add_argument("--out-dir", required=True, help="output directory")
 ap.add_argument("--g1", default=str(G1_USD), help="G1 USD (geometry layer)")
-ap.add_argument("--eye-z", type=float, default=1.30, help="ego camera height (m)")
 ap.add_argument("--robot-z", type=float, default=0.79, help="G1 root height (m)")
 ap.add_argument("--fps", type=int, default=30, help="output video frame rate")
 ap.add_argument("--max-frames", type=int, default=300, help="cap on rendered frames")
@@ -55,10 +54,13 @@ enable_extension("isaacsim.sensors.camera")
 from isaacsim.core.api import World  # noqa: E402
 from isaacsim.core.utils.viewports import set_camera_view  # noqa: E402
 from isaacsim.sensors.camera import Camera  # noqa: E402
-from pxr import Gf, UsdGeom  # noqa: E402
+from pxr import Gf, Usd, UsdGeom  # noqa: E402
 
 CAM_W, CAM_H = 1280, 960
-EGO_FWD = 0.30  # ego camera offset ahead of the robot axis (clears the head)
+# ego camera local transform on the G1 torso: 0.12 m forward + 0.42 m up, and a
+# rotation so the camera looks along the robot's +x (forward), +z up. Rows are
+# the camera's X/Y/Z axes expressed in the torso frame, then the translation.
+EGO_LOCAL = Gf.Matrix4d(0, -1, 0, 0, 0, 0, 1, 0, -1, 0, 0, 0, 0.12, 0, 0.42, 1)
 
 
 def resample(wp, step):
@@ -177,7 +179,19 @@ def main() -> int:
     world = World()
     world.reset()
 
-    ego = Camera(prim_path="/ego_cam", resolution=(CAM_W, CAM_H))
+    # ego camera rigidly mounted on the G1 torso (like run_mujoco) -- it is a
+    # child of the torso prim with a fixed local transform, so it rides the
+    # robot. The G1's internal frames are det+1, so a camera under it is safe.
+    torso_path = str(g1.GetPath())
+    for prim in Usd.PrimRange(g1):
+        if prim.GetName() == "torso_link":
+            torso_path = str(prim.GetPath())
+            break
+    print(f"ego camera mount: {torso_path}", flush=True)
+    ego = Camera(prim_path=f"{torso_path}/ego_cam", resolution=(CAM_W, CAM_H))
+    ego_xf = UsdGeom.Xformable(stage.GetPrimAtPath(f"{torso_path}/ego_cam"))
+    ego_xf.ClearXformOpOrder()
+    ego_xf.AddTransformOp().Set(EGO_LOCAL)
     ego.initialize()
     ego.add_distance_to_image_plane_to_frame()
     chase = Camera(prim_path="/chase_cam", resolution=(CAM_W, CAM_H))
@@ -193,15 +207,10 @@ def main() -> int:
         a = float(yaws[pi])
         ca, sa = np.cos(a), np.sin(a)
 
+        # drive the G1; the ego camera is a child of the torso and rides along
         g1_t.Set(Gf.Vec3d(float(x), float(y), args.robot_z))
         g1_r.Set(float(np.degrees(a)))
 
-        ex, ey = x + EGO_FWD * ca, y + EGO_FWD * sa
-        set_camera_view(
-            eye=[ex, ey, args.eye_z],
-            target=[ex + ca, ey + sa, args.eye_z - 0.15],
-            camera_prim_path="/ego_cam",
-        )
         set_camera_view(
             eye=[x - 4.5 * ca, y - 4.5 * sa, 3.0],
             target=[x, y, 1.0],

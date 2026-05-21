@@ -156,11 +156,14 @@ diagnostic history.
    under `/World`: a converted scene's `/World` can carry a det-1 reflection
    transform (the mansion handedness fix) that IsaacSim's `XFormPrim` pose math
    rejects (`scipy Rotation.from_matrix`, non-positive determinant).
-4. **Drive + capture** — per smoothed pose, place `/g1` (translate + Z-rotate),
-   aim the `/ego_cam` and `/chase_cam` `Camera` sensors via `set_camera_view`,
-   `world.step(render=True)`, then read `get_rgba()` and the
-   `distance_to_image_plane` depth.
-5. **Assemble** — H.264 via the system `/usr/bin/ffmpeg` (with
+4. **Cameras** — the ego `Camera` sensor is a child of `/g1/pelvis/torso_link`
+   with a fixed local transform (0.12 m forward + 0.42 m up, looking along the
+   robot's +x), so it rides the robot like run_mujoco's torso-mounted camera.
+   The chase `Camera` is at the root and re-aimed per frame.
+5. **Drive + capture** — per smoothed pose, place `/g1` (translate + Z-rotate),
+   aim `/chase_cam` via `set_camera_view`, `world.step(render=True)`, then read
+   `get_rgba()` and the `distance_to_image_plane` depth from each sensor.
+6. **Assemble** — H.264 via the system `/usr/bin/ffmpeg` (with
    `LD_LIBRARY_PATH` stripped — the isaacsim env's libs break it), **before**
    `app.close()` (fast-shutdown can hard-exit the process).
 
