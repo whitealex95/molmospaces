@@ -170,6 +170,18 @@ diagnostic history.
 Output: `<out-dir>/{ego_isaac,depth_isaac,follow_isaac}.mp4`. A 2×2 combined
 panel is not yet replicated for IsaacSim.
 
+**Per-scene tuning** (applied in code, via the session layer — the USD asset is
+never modified):
+- *Light taming* — procthor USD scenes ship a 1000-intensity DomeLight +
+  DistantLight that wash the render out; `tame_lights()` clamps them
+  (`--dome-max`, `--distant-max`). The mansion USD has no lights of its own.
+- *Chase camera* — `--chase-z` / `--chase-back`; procthor scenes have a
+  ceiling, so the chase sits lower (e.g. `--chase-z 2.1 --chase-back 2.6`);
+  the ceiling-less mansion uses the defaults (3.0 / 4.5).
+- *Object references* — procthor USD scenes resolve furniture from
+  `usd/scenes/objects/{thor,objaverse}`, which must be symlinked to
+  `usd/objects/<src>/<version>` (filesystem only).
+
 ## Driver — `gen_trajectories.py`
 
 Batches the three stages for one scene; run once per scene.
