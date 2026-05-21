@@ -19,6 +19,8 @@ Renderer (--renderer):
 
 import argparse
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -288,7 +290,48 @@ def main() -> int:
         combined.append(np.vstack([top, bot]))
 
     def write_video(path, frames, fps=STEP_HZ):
+        """Encode BGR uint8 frames to an H.264 mp4 via ffmpeg.
+
+        H.264 + yuv420p is what browsers and Notion can play. OpenCV's mp4v
+        is MPEG-4 Part 2, whose Simple Profile caps out near 1280x720 -- the
+        1280x960 combined panel exceeds it and fails to render online. Falls
+        back to OpenCV mp4v only if ffmpeg is not on PATH."""
         h, w = frames[0].shape[:2]
+        if shutil.which("ffmpeg"):
+            proc = subprocess.Popen(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "bgr24",
+                    "-s",
+                    f"{w}x{h}",
+                    "-r",
+                    str(fps),
+                    "-i",
+                    "-",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-crf",
+                    "20",
+                    "-movflags",
+                    "+faststart",
+                    str(path),
+                ],
+                stdin=subprocess.PIPE,
+            )
+            for f in frames:
+                proc.stdin.write(np.ascontiguousarray(f, dtype=np.uint8).tobytes())
+            proc.stdin.close()
+            if proc.wait() != 0:
+                raise RuntimeError(f"ffmpeg failed encoding {path}")
+            return
         vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
         for f in frames:
             vw.write(f)
