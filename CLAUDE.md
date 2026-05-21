@@ -24,6 +24,9 @@ Before answering questions about install steps, asset/resource management, env v
 | `docs/tutorials/` | Task-shaped walkthroughs (e.g. `add_robot/`) |
 | `molmo_spaces_isaac/README.md`, `molmo_spaces_maniskill/README.md` | Sub-package install + CLI scripts |
 | `mlspaces_tests/README.md` | Test fixture regeneration + upload workflow |
+| `docs/mansion_to_usd.md` | **MansionWorld floor JSON → USDA conversion.** Read first for anything related to the mansion dataset (`~/Projects/mansion`), AI2-THOR/Holodeck JSON → USD, or `scripts/mansion/`. Mansion uses its own asset caches (`~/.objathor-assets/`, mansion_patch) — the molmospaces housegen + `ms-convert-houses` pipeline cannot convert mansion scenes end-to-end. |
+| `docs/mansion_to_mjcf.md` | **MansionWorld floor JSON → MJCF conversion** (sibling of the USDA doc). For loading mansion scenes in MuJoCo viewer / `MjModel`. Same source caches, same 100 % coverage, different output target. Note that molmospaces's objaverse MJCF cache is on-disk metadata-only and covers only ~48 % of mansion's objathor UIDs even after bulk download — direct `.pkl.gz` → `.obj` bake is required. |
+| `docs/navigation_pipeline.md` | **2D A\* navigation + G1 egocentric-render pipeline** (`scripts/navigation/`). Read this first — and **keep it in sync** — for anything touching the navigation scripts: occupancy-grid building (`build_occupancy.py`), clearance-aware A\* planning (`plan.py`), the kinematic G1 ego/chase video runtime (`run_mujoco.py`), or the batch trajectory generator (`gen_trajectories.py`). Whenever you change a `scripts/navigation/` script, update this doc in the same change. |
 | `pyproject.toml` | Declared deps, extras, ruff config |
 
 For runtime crashes or unfamiliar errors, also check open GitHub issues — the project's contributors often document workarounds there before they reach the docs:
@@ -349,6 +352,29 @@ All `MLSPACES_*` variables are **optional** — every one has a working default.
 | `MUJOCO_EGL_DEVICE_ID` | Render device — indices do not match `CUDA_VISIBLE_DEVICES` (see issue #66) | `0` |
 | `MUJOCO_GL=egl`, `PYOPENGL_PLATFORM=egl` | Required for headless rendering on Linux | _(unset)_ |
 | `FILAMENT_OPENGL_HANDLE_ARENA_SIZE_IN_MB` | Filament's GPU-handle arena size. **Does NOT fix the THORMAP segfault** (see Known issues) | `~8` (built-in) |
+
+## Local data inventory (snapshot 2026-05-19)
+
+Two parallel asset stores on disk. Re-verify with `du -sh ~/.molmospaces ~/.cache/molmospaces`.
+
+### USD (Isaac) — `~/.molmospaces/usd/`, symlinked into `assets/usd/`
+
+`du -sh assets/usd/` reports only the symlink entries (~4 KB). Use `du -shL` to follow symlinks, or measure the cache directly.
+
+| Dataset | Real size |
+|---|---|
+| `objects/thor/20260128` | 3.0 GB |
+| `objects/objaverse/20260128` | 24 GB |
+| `scenes/ithor/20260121` | 323 MB |
+| `scenes/procthor-10k-val/20260128` | 22 GB |
+| `scenes/procthor-objaverse-val/20260128` | **176 GB** |
+| **Total** | **224 GB** |
+
+ProcTHOR scenes reference the standalone object library at runtime (`AddReference(rel_model_path)` in `molmo_spaces_isaac/src/molmo_spaces_isaac/assets/house_converter.py:740,777`) — they need `objects/thor` (and `objects/objaverse` for procthor-objaverse). iThor scenes bake geometry into their own `Payload/GeometryLibrary.usdc` and don't need the standalone library.
+
+### MJCF (MuJoCo) — `~/.cache/molmospaces/assets/<base64url(project_path)>/`
+
+In progress as of this snapshot — downloading via `python -m molmo_spaces.molmo_spaces_constants` (README's default install procedure). Last measured partial size: ~1.3 GB. The download covers scenes, objects, robots, benchmarks, grasps, datagen, test_data.
 
 ## Conventions
 
