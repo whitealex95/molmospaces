@@ -138,29 +138,34 @@ Scene + `path.npz` → the egocentric/chase video.
 
 ## Stage 3 (IsaacSim) — `run_isaac.py`
 
-The IsaacSim counterpart of `run_mujoco.py`: flies an egocentric camera along
-the same `path.npz` through a **USD** scene and renders `ego_isaac.mp4`. See
-`docs/isaac_navigation_log.md` for the full diagnostic history.
+The IsaacSim counterpart of `run_mujoco.py`: drives a Unitree G1 along the same
+`path.npz` through a **USD** scene and renders the robot's egocentric RGB +
+depth and a chase view. See `docs/isaac_navigation_log.md` for the full
+diagnostic history.
 
 1. **GUI mode, not headless** — `SimulationApp(headless=False)`. IsaacSim's
    headless camera-sensor API crashes here (`IRenderSettings ... stage-id`);
-   GUI-mode viewport rendering is reliable. It therefore needs a display — run
+   GUI mode keeps the render path alive. It therefore needs a display — run
    with the Chrome Remote Desktop virtual display `:20`
    (`DISPLAY=:20 XAUTHORITY=$HOME/.Xauthority`), in the `mlspaces-isaac` env.
-2. **Open the USD scene** — `omni.usd` `open_stage`. The path is reused as-is:
-   the mansion USD shares the mansion MJCF world frame (both converters apply
-   one convention). procthor USD frame-alignment is unverified.
-3. **Fly the camera** — reuse the `run_mujoco` path helpers (`resample`,
-   `smooth`, `compute_yaws`); per pose `set_camera_view(eye, target)` at eye
-   height 1.3 m, `app.update()`, then `capture_viewport_to_file` for a clean
-   per-frame PNG.
-4. **Assemble** — H.264 via the system `/usr/bin/ffmpeg` (with
-   `LD_LIBRARY_PATH` stripped, since the isaacsim env's libs break it). This
-   runs **before** `app.close()` — IsaacSim fast-shutdown can hard-exit the
-   process, so nothing after `close()` is guaranteed to run.
+2. **Open the USD scene + add the G1** — `omni.usd` `open_stage`; the G1
+   (`g1_isaac/g1.usd`, imported from MJCF with the `MJCFCreate*` kit commands)
+   is referenced at the **stage root** `/g1`. The path is reused as-is: the
+   mansion USD shares the mansion MJCF world frame.
+3. **Stage-root rule** — the G1 and both cameras live at the stage root, never
+   under `/World`: a converted scene's `/World` can carry a det-1 reflection
+   transform (the mansion handedness fix) that IsaacSim's `XFormPrim` pose math
+   rejects (`scipy Rotation.from_matrix`, non-positive determinant).
+4. **Drive + capture** — per smoothed pose, place `/g1` (translate + Z-rotate),
+   aim the `/ego_cam` and `/chase_cam` `Camera` sensors via `set_camera_view`,
+   `world.step(render=True)`, then read `get_rgba()` and the
+   `distance_to_image_plane` depth.
+5. **Assemble** — H.264 via the system `/usr/bin/ffmpeg` (with
+   `LD_LIBRARY_PATH` stripped — the isaacsim env's libs break it), **before**
+   `app.close()` (fast-shutdown can hard-exit the process).
 
-Output: `<out-dir>/ego_isaac.mp4`. Currently ego RGB only; depth, a chase view,
-and the 2×2 combined panel are not yet replicated for IsaacSim.
+Output: `<out-dir>/{ego_isaac,depth_isaac,follow_isaac}.mp4`. A 2×2 combined
+panel is not yet replicated for IsaacSim.
 
 ## Driver — `gen_trajectories.py`
 
