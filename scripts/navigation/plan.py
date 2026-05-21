@@ -2,9 +2,10 @@
 """Clearance-aware A* path planning on a sim-agnostic occupancy grid.
 
 Loads ``occupancy.npz`` (from build_occupancy.py), dilates obstacles by the
-agent radius, runs A* (molmo_spaces.utils.distance_transform_utils -- the
-edge weights favour clearance, so the path keeps away from walls), and writes
-a world-frame waypoint path that both the MuJoCo and IsaacSim runtimes follow.
+agent radius, and runs A* whose edge weights favour clearance (the path keeps
+away from walls). The ``Planner`` class is reusable -- built once per scene it
+plans any number of start/goal cell pairs; gen_trajectories.py uses it to
+batch-sample trajectories. Run as a script it plans one room->room path.
 
 Output: ``path.npz`` next to the occupancy grid:
   waypoints   (N,2) float -- world (x,y) waypoints, start -> goal
@@ -41,6 +42,106 @@ def px_to_world(map_to_world, row, col):
     return (map_to_world @ np.array([row, col, 1.0]))[:2]  # -> (x, y)
 
 
+class Planner:
+    """Clearance-aware A* over a downscaled occupancy grid.
+
+    Built once per (scene, agent_radius); ``plan()`` any number of start/goal
+    coarse-cell pairs. Shared by this script's CLI and gen_trajectories.py.
+    """
+
+    def __init__(self, occupancy_npz, agent_radius: float = 0.2):
+        o = np.load(occupancy_npz, allow_pickle=True)
+        self.occ = o["occupancy"]  # bool, True = free
+        self.room_map = o["room_map"]
+        self.room_names = [str(s) for s in o["room_names"]]
+        self.world_to_map = o["world_to_map"]
+        self.map_to_world = o["map_to_world"]
+        self.px_per_m = float(o["px_per_m"])
+        self.agent_radius = agent_radius
+
+        # agent-radius clearance, then downscale (min-pool: a coarse cell is
+        # free only if every fine cell is free).
+        self.rad_px = max(1, int(round(agent_radius * self.px_per_m)))
+        free = cv2.dilate((~self.occ).astype(np.uint8), circular_kernel(self.rad_px)) == 0
+        ds = DOWNSCALE
+        hd, wd = free.shape[0] // ds, free.shape[1] // ds
+        self.grid = free[: hd * ds, : wd * ds].reshape(hd, ds, wd, ds).min(axis=(1, 3))
+        self.ds = ds
+        self.grid_spacing = ds / self.px_per_m
+        self.dt = dtu.make_distance_transform(self.grid, self.grid_spacing)
+        self.graph = dtu.make_grid_graph(self.grid, self.dt, weight_exp=2)
+
+        # navigable A* cells per room index (1..R)
+        self._room_cells = {}
+        for idx in range(1, len(self.room_names) + 1):
+            m = (self.room_map == idx)[: hd * ds, : wd * ds]
+            m = m.reshape(hd, ds, wd, ds).any(axis=(1, 3)) & self.grid
+            rs, cs = np.where(m)
+            cells = [(int(r), int(c)) for r, c in zip(rs, cs) if (int(r), int(c)) in self.graph]
+            if cells:
+                self._room_cells[idx] = cells
+
+        # A* connected component of every node
+        self.comp_of = {}
+        for ci, comp in enumerate(nx.connected_components(self.graph)):
+            for node in comp:
+                self.comp_of[node] = ci
+
+    @property
+    def room_indices(self) -> list[int]:
+        return sorted(self._room_cells)
+
+    def room_name(self, idx: int) -> str:
+        return self.room_names[idx - 1]
+
+    def room_cells(self, idx: int) -> list[tuple[int, int]]:
+        """Navigable A* cells (r,c) belonging to room ``idx``."""
+        return self._room_cells.get(idx, [])
+
+    def room_anchor(self, idx: int):
+        """The most-open navigable cell of a room (maximum clearance)."""
+        cells = self.room_cells(idx)
+        return max(cells, key=lambda rc: float(self.dt[rc])) if cells else None
+
+    def connectivity(self) -> list[list[int]]:
+        """Room-index groups; rooms in a group are mutually reachable.
+        Sorted largest group first."""
+        groups = defaultdict(list)
+        for idx in self.room_indices:
+            a = self.room_anchor(idx)
+            if a is not None and a in self.comp_of:
+                groups[self.comp_of[a]].append(idx)
+        return sorted(groups.values(), key=len, reverse=True)
+
+    def plan(self, start_cell, goal_cell):
+        """A* between two coarse cells. Returns (waypoints_world (N,2),
+        length_m) or None if the cells are not mutually reachable."""
+        if start_cell not in self.graph or goal_cell not in self.graph:
+            return None
+        if self.comp_of.get(start_cell) != self.comp_of.get(goal_cell):
+            return None
+        sr, sc = start_cell
+        gr, gc = goal_cell
+        wp_px, _, _ = dtu.make_discrete_path(
+            self.graph, sr, sc, gr, gc, self.dt, 2, self.grid_spacing, 0.6
+        )
+        wp_full = np.array(wp_px, dtype=float) * self.ds  # coarse -> full-res px
+        waypoints = np.array([px_to_world(self.map_to_world, r, c) for r, c in wp_full])
+        length = float(np.linalg.norm(np.diff(waypoints, axis=0), axis=1).sum())
+        return waypoints, length
+
+    def save_path(self, out, waypoints, start_room: str, goal_room: str) -> None:
+        """Write ``path.npz`` and a ``*_debug.png`` overlay next to it."""
+        out = Path(out)
+        np.savez(out, waypoints=waypoints, start_room=start_room, goal_room=goal_room)
+        vis = np.where(self.occ[..., None], 235, 40).astype(np.uint8).repeat(3, axis=2)
+        pts = np.array([world_to_px(self.world_to_map, x, y)[::-1] for x, y in waypoints], np.int32)
+        cv2.polylines(vis, [pts], False, (0, 140, 255), max(2, self.rad_px // 3), cv2.LINE_AA)
+        cv2.circle(vis, tuple(pts[0]), self.rad_px, (0, 200, 0), -1, cv2.LINE_AA)
+        cv2.circle(vis, tuple(pts[-1]), self.rad_px, (0, 0, 230), -1, cv2.LINE_AA)
+        cv2.imwrite(str(out.with_name(out.stem + "_debug.png")), vis)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -59,112 +160,53 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    o = np.load(args.occupancy, allow_pickle=True)
-    occ = o["occupancy"]  # bool, True = free
-    room_map = o["room_map"]
-    room_names = [str(s) for s in o["room_names"]]
-    world_to_map = o["world_to_map"]
-    map_to_world = o["map_to_world"]
-    px_per_m = float(o["px_per_m"])
+    planner = Planner(args.occupancy, args.agent_radius)
+    print(f"A* graph: {planner.graph.number_of_nodes()} navigable nodes")
 
-    # agent-radius clearance, then downscale (min-pool: a coarse cell is free
-    # only if every fine cell is free).
-    rad_px = max(1, int(round(args.agent_radius * px_per_m)))
-    free = cv2.dilate((~occ).astype(np.uint8), circular_kernel(rad_px)) == 0
-    ds = DOWNSCALE
-    hd, wd = free.shape[0] // ds, free.shape[1] // ds
-    grid = free[: hd * ds, : wd * ds].reshape(hd, ds, wd, ds).min(axis=(1, 3))
-    grid_spacing = ds / px_per_m
-
-    dt = dtu.make_distance_transform(grid, grid_spacing)
-    graph = dtu.make_grid_graph(grid, dt, weight_exp=2)
-    print(f"A* graph: {hd}x{wd} cells, {graph.number_of_nodes()} navigable nodes")
-
-    # Per-room anchor = the most-open navigable coarse cell of that room.
-    def coarse_mask(room_idx):
-        m = (room_map == room_idx)[: hd * ds, : wd * ds]
-        return m.reshape(hd, ds, wd, ds).any(axis=(1, 3)) & grid
-
-    anchors, sizes = {}, {}
-    for idx, name in enumerate(room_names, start=1):
-        m = coarse_mask(idx)
-        if not m.any():
-            continue
-        r, c = np.unravel_index(np.argmax(np.where(m, dt, -1.0)), m.shape)
-        if (int(r), int(c)) in graph:
-            anchors[name] = (int(r), int(c))
-            sizes[name] = int(m.sum())
-    if len(anchors) < 2:
-        raise SystemExit(f"need >=2 navigable rooms; got {list(anchors)}")
-
-    # Connectivity: rooms whose anchors fall in the same A* component are
-    # mutually reachable -- i.e. any pair of them is a valid room->room
-    # scenario. Disconnected groups mean a doorway got sealed (over-dilated).
-    comp_of = {}
-    for ci, comp in enumerate(nx.connected_components(graph)):
-        for node in comp:
-            comp_of[node] = ci
-    groups = defaultdict(list)
-    for name, a in anchors.items():
-        groups[comp_of[a]].append(name)
-    groups = sorted(groups.values(), key=len, reverse=True)
+    groups = planner.connectivity()
     print(f"Room connectivity ({len(groups)} group(s); rooms in a group are mutually reachable):")
     for grp in groups:
-        print(f"  - {grp}")
-    reachable = set(groups[0])
-    if len(groups) > 1:
-        print(
-            f"  NOTE: {len(anchors) - len(reachable)} room(s) disconnected -- "
-            f"reduce --agent-radius or widen DOOR_CARVE_M if a doorway sealed."
-        )
+        print(f"  - {[planner.room_name(i) for i in grp]}")
+    if not groups or len(groups[0]) < 2:
+        raise SystemExit("need >=2 mutually reachable rooms for a room->room path")
+    reachable = groups[0]
 
     def pick(sub):
-        return next((n for n in anchors if sub.lower() in n.lower()), None)
+        return next((i for i in reachable if sub.lower() in planner.room_name(i).lower()), None)
 
     if args.start_room:
-        start_name = pick(args.start_room)
-        if start_name is None:
-            raise SystemExit(f"--start-room '{args.start_room}' matched nothing in {list(anchors)}")
+        start_idx = pick(args.start_room)
+        if start_idx is None:
+            raise SystemExit(f"--start-room '{args.start_room}' matched no reachable room")
     else:
-        start_name = max(reachable, key=lambda n: sizes[n])
+        start_idx = max(reachable, key=lambda i: len(planner.room_cells(i)))
 
-    reach = nx.single_source_dijkstra_path_length(graph, anchors[start_name])
     if args.goal_room:
-        goal_name = pick(args.goal_room)
-        if goal_name is None:
-            raise SystemExit(f"--goal-room '{args.goal_room}' matched nothing in {list(anchors)}")
-        if anchors[goal_name] not in reach:
-            raise SystemExit(
-                f"'{goal_name}' is not reachable from '{start_name}' (different group)"
-            )
-    else:  # farthest reachable room
-        cands = {n: reach[a] for n, a in anchors.items() if n != start_name and a in reach}
+        goal_idx = pick(args.goal_room)
+        if goal_idx is None:
+            raise SystemExit(f"--goal-room '{args.goal_room}' matched no reachable room")
+    else:  # farthest reachable room from the start anchor
+        reach = nx.single_source_dijkstra_path_length(planner.graph, planner.room_anchor(start_idx))
+        cands = {
+            i: reach[planner.room_anchor(i)]
+            for i in reachable
+            if i != start_idx and planner.room_anchor(i) in reach
+        }
         if not cands:
             raise SystemExit("no room reachable from the start room")
-        goal_name = max(cands, key=cands.get)
+        goal_idx = max(cands, key=cands.get)
 
-    sr, sc = anchors[start_name]
-    gr, gc = anchors[goal_name]
-    waypoints_px, _, cost = dtu.make_discrete_path(graph, sr, sc, gr, gc, dt, 2, grid_spacing, 0.6)
-    wp_full = np.array(waypoints_px, dtype=float) * ds  # coarse -> full-res px
-    waypoints = np.array([px_to_world(map_to_world, r, c) for r, c in wp_full])
-    length = float(np.linalg.norm(np.diff(waypoints, axis=0), axis=1).sum())
+    res = planner.plan(planner.room_anchor(start_idx), planner.room_anchor(goal_idx))
+    if res is None:
+        raise SystemExit("planning failed: start and goal not mutually reachable")
+    waypoints, length = res
+    start_name, goal_name = planner.room_name(start_idx), planner.room_name(goal_idx)
     print(f"path: {start_name} -> {goal_name}  |  {len(waypoints)} waypoints, {length:.1f} m")
 
     out = (args.out or args.occupancy.with_name("path.npz")).resolve()
-    np.savez(out, waypoints=waypoints, start_room=start_name, goal_room=goal_name)
-
-    # debug overlay
-    vis = np.where(occ[..., None], 235, 40).astype(np.uint8).repeat(3, axis=2)
-    pts = np.array([world_to_px(world_to_map, x, y)[::-1] for x, y in waypoints], np.int32)
-    cv2.polylines(vis, [pts], False, (0, 140, 255), max(2, rad_px // 3), cv2.LINE_AA)
-    cv2.circle(vis, tuple(pts[0]), rad_px, (0, 200, 0), -1, cv2.LINE_AA)
-    cv2.circle(vis, tuple(pts[-1]), rad_px, (0, 0, 230), -1, cv2.LINE_AA)
-    dbg = out.with_name("path_debug.png")
-    cv2.imwrite(str(dbg), vis)
-
+    planner.save_path(out, waypoints, start_name, goal_name)
     print(f"wrote: {out}")
-    print(f"       {dbg}")
+    print(f"       {out.with_name(out.stem + '_debug.png')}")
     return 0
 
 

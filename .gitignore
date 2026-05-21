@@ -53,3 +53,6 @@ mlspaces_tests/**/test_data
 # pytest
 .pytest_cache/
 __pycache__/
+
+# navigation pipeline outputs (occupancy grids, planned paths, rendered videos)
+nav_runs/
