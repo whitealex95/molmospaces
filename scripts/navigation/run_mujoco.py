@@ -11,7 +11,10 @@ Output (in <scene_dir>/nav_run/):
   combined.mp4   -- 2x2: top-down map | chase | ego RGB | ego depth
   ego_rgb.mp4 / ego_depth.mp4 / follow.mp4  -- the individual streams
 
-Run from the ``mlspaces-mujoco`` env (OpenGL renderer).
+Renderer (--renderer):
+  opengl    -- stock MuJoCo OpenGL; run from the ``mlspaces-mujoco`` env.
+  filament  -- physically based lighting + shadows; run from ``mlspaces``
+               (needs the Filament mujoco wheel) for noticeably better RGB.
 """
 
 import argparse
@@ -84,8 +87,12 @@ def compute_yaws(poses: np.ndarray, alpha: float) -> np.ndarray:
     return yaws
 
 
-def build_model(scene_xml: Path, g1_xml: Path):
-    """Merge the G1 into the scene MJCF; add a head-mounted 'ego' camera."""
+def build_model(scene_xml: Path, g1_xml: Path, backend: str = "opengl"):
+    """Merge the G1 into the scene MJCF; add a head-mounted 'ego' camera.
+
+    For the Filament backend a forward fill light is also mounted on the torso.
+    Filament ignores the MuJoCo headlight, so an interior ego view would
+    otherwise be lit by scene lights alone and read near-black."""
     scene = mujoco.MjSpec.from_file(str(scene_xml))
     g1 = mujoco.MjSpec.from_file(str(g1_xml))
 
@@ -104,6 +111,16 @@ def build_model(scene_xml: Path, g1_xml: Path):
     cam.pos = [0.12, 0.0, 0.42]
     cam.quat = [0.5, 0.5, -0.5, -0.5]  # look along +x (forward), +z world-up
 
+    if backend == "filament":
+        lamp = torso.add_light()
+        lamp.name = "ego_lamp"
+        lamp.type = mujoco.mjtLightType.mjLIGHT_DIRECTIONAL
+        lamp.pos = [0.12, 0.0, 0.42]
+        lamp.dir = [1.0, 0.0, -0.15]  # robot-forward, slightly down
+        lamp.diffuse = [2.5, 2.5, 2.5]  # bright: Filament has no headlight fill
+        lamp.specular = [0.1, 0.1, 0.1]
+        lamp.castshadow = 0
+
     return scene.compile()
 
 
@@ -111,6 +128,37 @@ def colorize_depth(depth: np.ndarray, near=0.1, far=8.0) -> np.ndarray:
     d = np.clip(np.nan_to_num(depth, nan=far, posinf=far), near, far)
     norm = ((d - near) / (far - near) * 255).astype(np.uint8)
     return cv2.applyColorMap(255 - norm, cv2.COLORMAP_TURBO)
+
+
+def make_renderer(model, height: int, width: int, backend: str):
+    """Build an offscreen renderer; returns ``render(data, camera, depth=False)``.
+
+    opengl   -- stock ``mujoco.Renderer`` (run in the mlspaces-mujoco env).
+    filament -- molmospaces ``MjFilamentRenderer``: physically based lighting
+                + shadows; needs the Filament mujoco wheel (mlspaces env).
+    """
+    if backend == "filament":
+        from molmo_spaces.env.mj_extensions import MjModelBindings
+        from molmo_spaces.renderer.filament_rendering import MjFilamentRenderer
+
+        r = MjFilamentRenderer(MjModelBindings(model), height=height, width=width)
+        update = r.update
+    else:
+        r = mujoco.Renderer(model, height, width)
+        update = r.update_scene
+
+    def render(data, camera, depth: bool = False) -> np.ndarray:
+        if depth:
+            r.enable_depth_rendering()
+            update(data, camera)
+            out = np.array(r.render())
+            r.disable_depth_rendering()
+            return out
+        r.disable_depth_rendering()
+        update(data, camera)
+        return np.array(r.render())
+
+    return render
 
 
 def build_map_panel(occ_path: Path, poses: np.ndarray, pw: int, ph: int):
@@ -176,6 +224,12 @@ def main() -> int:
     )
     ap.add_argument("--g1", type=Path, default=G1_XML)
     ap.add_argument("--out-dir", type=Path, default=None)
+    ap.add_argument(
+        "--renderer",
+        choices=["opengl", "filament"],
+        default="opengl",
+        help="opengl (mlspaces-mujoco env) or filament (mlspaces env, better RGB)",
+    )
     args = ap.parse_args()
 
     occ_path = args.occupancy or args.scene.parent / "occupancy.npz"
@@ -188,13 +242,16 @@ def main() -> int:
 
     poses = smooth_path(resample_path(waypoints, SPEED / STEP_HZ), SMOOTH_WINDOW)
     yaws = compute_yaws(poses, YAW_ALPHA)
-    print(f"merging G1; {len(poses)} smoothed kinematic steps @ {STEP_HZ:.0f} Hz")
+    print(
+        f"merging G1; {len(poses)} smoothed kinematic steps @ {STEP_HZ:.0f} Hz"
+        f"  [{args.renderer} renderer]"
+    )
 
-    model = build_model(args.scene, args.g1)
+    model = build_model(args.scene, args.g1, args.renderer)
     data = mujoco.MjData(model)
     base_adr = model.joint("g1_floating_base_joint").qposadr[0]
 
-    renderer = mujoco.Renderer(model, EGO_H, EGO_W)
+    render = make_renderer(model, EGO_H, EGO_W, args.renderer)
     followcam = mujoco.MjvCamera()
     followcam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
     followcam.trackbodyid = model.body("g1_pelvis").id
@@ -210,19 +267,13 @@ def main() -> int:
         data.qpos[base_adr : base_adr + 7] = [x, y, PELVIS_Z, *yaw_quat(yaw)]
         mujoco.mj_forward(model, data)
 
-        renderer.disable_depth_rendering()
-        renderer.update_scene(data, camera="ego")
-        rgb = renderer.render()[:, :, ::-1].copy()
+        rgb = render(data, "ego")[:, :, ::-1].copy()
         rgb_frames.append(rgb)
 
-        renderer.enable_depth_rendering()
-        renderer.update_scene(data, camera="ego")
-        depth = colorize_depth(renderer.render())
+        depth = colorize_depth(render(data, "ego", depth=True))
         depth_frames.append(depth)
-        renderer.disable_depth_rendering()
 
-        renderer.update_scene(data, followcam)
-        follow = renderer.render()[:, :, ::-1].copy()
+        follow = render(data, followcam)[:, :, ::-1].copy()
         follow_frames.append(follow)
 
         # 2D map panel: static layout + a marker at the robot pose
