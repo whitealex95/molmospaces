@@ -54,6 +54,7 @@ navigation video — the IsaacSim counterpart of `run_mujoco.py`.
 | 11 | 2026-05-21 | procthor-objaverse-val (`val_1567`) in IsaacSim | ✅ works | A procthor-objaverse scene needs both a USD (for the render) and an MJCF that compiles (for occupancy/plan). The objaverse MJCF object library is an incomplete subset, so most scenes' MJCFs fail on a missing object — of 4 candidates with USDs, only `val_1567` compiled. It is a 1-room scene → within-room path (via `Planner` / `sample_trajectories`). Renders correctly with the same procthor flags. |
 | 12 | 2026-05-21 | Fix the floating G1 | ✅ fixed | The G1 floated ~0.47 m above the floor: `--robot-z` was 0.79, but the imported G1 USD's foot soles are at z=−0.315 from its origin (vs MuJoCo, where base z 0.793 lands the feet on the floor). Fix: `run_isaac.py` auto-derives the base z from the G1 geometry bbox (`-bbox.min.z`) so the soles sit on z=0 — computed after warm-up (the bbox is empty if queried before the reference composes). Verified: the G1 stands on the floor. |
 | 13 | 2026-05-21 | USD-based occupancy (`build_occupancy_usd.py`) for scenes whose MJCF won't compile | ✅ works | The MJCF route can't build occupancy for procthor-objaverse scenes with incomplete MJCFs. `build_occupancy_usd.py` rasterizes the occupancy straight from the USD geometry — `room_N_visual_0` floors, `wall_*_visual_0` walls, `doorway_*` carves, and furniture/decor Xform bboxes as obstacles. Output is byte-compatible with `build_occupancy.py`. Verified end-to-end on `val_1413`: occupancy (4 rooms, all connected) → `plan.py` (10.6 m cross-room path) → `run_isaac.py` videos. |
+| 14 | 2026-05-21 | Align run_isaac cameras with run_mujoco; add the 2×2 combined; rename outputs | ✅ done | Measured run_mujoco's chase camera (`mjCAMERA_TRACKING` at azimuth 130 / elevation -55 / distance 6) — it is a fixed world offset `(2.21, -2.66, 4.83)` from the tracked pelvis. `run_isaac.py` now places `/chase_cam` at that exact offset and sets both cameras to a 45° vertical FOV (MuJoCo's default fovy). Added the per-frame 2×2 `isaac_combined.mp4` (top-down map \| chase \| ego RGB \| ego depth) + montage; outputs renamed `isaac_{ego,depth,follow,combined}.mp4`. Grounding: the bbox auto-detect (trial 12) returns an *empty* bound on the instanced G1 USD, so it was always falling back — replaced with the measured constant `G1_GROUND_Z = 0.315` (the mansion and procthor floors are both at z=0). The user's "still floating" report was the mansion `nav_runs` videos predating trial 12; regenerating all 15 renders grounds them. Both procthor and mansion USDs are open-top (no ceiling), so the high MuJoCo chase needs no per-scene tuning. |
 
 ## Key findings — IsaacSim rendering SOLVED
 
@@ -94,9 +95,6 @@ Verified:
 
 ## Remaining work / next steps
 
-- **2×2 combined panel**: `run_isaac.py` writes `ego_isaac` / `depth_isaac` /
-  `follow_isaac` as separate videos; run_mujoco's single 2×2 combined video
-  (map | chase | ego RGB | ego depth) is not replicated for IsaacSim.
 - **Driver wiring**: `gen_trajectories.py` has no `--sim isaac` option; the
   IsaacSim runtime is invoked directly.
 - **procthor-objaverse asset coverage**: the objaverse MJCF object library is
@@ -109,7 +107,9 @@ Verified:
   USD object library is substantially more complete than the MJCF one. The
   real bottleneck for procthor-objaverse in IsaacSim is the MJCF —
   `build_occupancy.py` needs it (MuJoCo render) for the occupancy + path.
-  Building occupancy from the USD directly would unlock those scenes.
+  `build_occupancy_usd.py` (trial 13) builds the occupancy from the USD
+  directly and unlocks those scenes — done for `val_1413`, `val_3116`,
+  `val_6469`.
 
 ## Working files
 

@@ -18,7 +18,7 @@ scene .xml ─▶ build_occupancy.py ─▶ occupancy.npz   2D occupancy + room 
 occupancy.npz ─▶ plan.py (Planner) ─▶ path.npz       A* world-frame waypoints
                                         │
 scene + path  ─▶ run_mujoco.py     ─▶ combined.mp4   G1 ego/chase video (MuJoCo)
-              └▶ run_isaac.py      ─▶ ego_isaac.mp4  egocentric video (IsaacSim)
+              └▶ run_isaac.py      ─▶ isaac_combined.mp4  G1 ego/chase video (IsaacSim)
 
 gen_trajectories.py orchestrates occupancy→plan→run_mujoco for N trajectories.
 ```
@@ -169,28 +169,32 @@ diagnostic history.
    under `/World`: a converted scene's `/World` can carry a det-1 reflection
    transform (the mansion handedness fix) that IsaacSim's `XFormPrim` pose math
    rejects (`scipy Rotation.from_matrix`, non-positive determinant).
-4. **Cameras** — the ego `Camera` sensor is a child of `/g1/pelvis/torso_link`
-   with a fixed local transform (0.12 m forward + 0.42 m up, looking along the
-   robot's +x), so it rides the robot like run_mujoco's torso-mounted camera.
-   The chase `Camera` is at the root and re-aimed per frame.
+4. **Cameras — identical placement to run_mujoco.** The ego `Camera` sensor is
+   a child of `/g1/pelvis/torso_link` with a fixed local transform (0.12 m
+   forward + 0.42 m up, looking along the robot's +x), so it rides the robot
+   like run_mujoco's torso-mounted camera. The chase `Camera` tracks the pelvis
+   from a fixed world offset equal to run_mujoco's tracking camera (azimuth 130
+   / elevation -55 / distance 6 — the offset is measured straight off the
+   MuJoCo camera). Both cameras use a 45° vertical FOV (MuJoCo's default camera
+   fovy). The G1 base sits at `G1_GROUND_Z` so its soles rest on the z=0 floor.
 5. **Drive + capture** — per smoothed pose, place `/g1` (translate + Z-rotate),
    aim `/chase_cam` via `set_camera_view`, `world.step(render=True)`, then read
    `get_rgba()` and the `distance_to_image_plane` depth from each sensor.
-6. **Assemble** — H.264 via the system `/usr/bin/ffmpeg` (with
+6. **Assemble** — the 2×2 combined panel (top-down map | chase | ego RGB | ego
+   depth) is built per frame, mirroring run_mujoco's `combined.mp4`. All
+   streams are encoded to H.264 via the system `/usr/bin/ffmpeg` (with
    `LD_LIBRARY_PATH` stripped — the isaacsim env's libs break it), **before**
    `app.close()` (fast-shutdown can hard-exit the process).
 
-Output: `<out-dir>/{ego_isaac,depth_isaac,follow_isaac}.mp4`. A 2×2 combined
-panel is not yet replicated for IsaacSim.
+Output: `<out-dir>/isaac_{ego,depth,follow,combined}.mp4` (+
+`isaac_combined_montage.png`). The `isaac_` prefix sets them apart from the
+MuJoCo renders at a glance.
 
 **Per-scene tuning** (applied in code, via the session layer — the USD asset is
 never modified):
 - *Light taming* — procthor USD scenes ship a 1000-intensity DomeLight +
   DistantLight that wash the render out; `tame_lights()` clamps them
   (`--dome-max`, `--distant-max`). The mansion USD has no lights of its own.
-- *Chase camera* — `--chase-z` / `--chase-back`; procthor scenes have a
-  ceiling, so the chase sits lower (e.g. `--chase-z 2.1 --chase-back 2.6`);
-  the ceiling-less mansion uses the defaults (3.0 / 4.5).
 - *Object references* — procthor USD scenes resolve furniture from
   `usd/scenes/objects/{thor,objaverse}`, which must be symlinked to
   `usd/objects/<src>/<version>` (filesystem only).
@@ -244,6 +248,7 @@ nav_runs/<dataset>/
     NN__<start>__to__<goal>/
       path.npz  path_debug.png  topdown.png
       combined.mp4  ego_rgb.mp4  ego_depth.mp4  follow.mp4  combined_montage.png
+      isaac_combined.mp4  isaac_ego.mp4  isaac_depth.mp4  isaac_follow.mp4
 ```
 `nav_runs/` lives at the repo root and is gitignored.
 
