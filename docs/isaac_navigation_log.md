@@ -77,26 +77,28 @@ DISPLAY=:20 XAUTHORITY=$HOME/.Xauthority \
     --scene <scene.usda> --path <path.npz> --out-dir <dir>
 ```
 
+`run_isaac.py` renders, per step, the robot's **egocentric RGB + depth** and a
+**chase view**; the ego camera is rigidly mounted on the G1 torso.
+
 Verified:
-- **mansion** — all 10 trajectories rendered cleanly:
-  `nav_runs/mansion/public_healthcare_3f_floor1/*/ego_isaac.mp4`.
-- **procthor** — `val_308` renders frame-aligned (`nav_runs/procthor-10k-val/val_308/ego_isaac.mp4`)
-  but washed-out; see Remaining work.
+- **mansion** — all 10 trajectories. Mansion USD has no lights of its own;
+  IsaacSim's default lighting renders it cleanly.
+- **procthor-10k-val** (`val_308`) — frame-aligned, furniture present, washout
+  fixed by light taming.
+- **procthor-objaverse-val** (`val_1567`) — same; a 1-room scene (within-room
+  path).
 
 ## Remaining work / next steps
 
-- **procthor render quality**: procthor works and is frame-aligned, but the
-  procthor USD renders washed-out/over-bright (pale hazy walls). Likely a
-  too-strong dome/environment light or unloaded wall materials in the procthor
-  USD. Needs investigation in the USD's lighting/material prims — independent
-  of `run_isaac.py`. Note: procthor USD scenes on disk (`val_308`, `val_565`,
-  …) do **not** overlap the downloaded procthor MJCF set (`val_0`–`4`); a
-  procthor IsaacSim run needs a scene present in both formats.
-- **Depth / chase / combined panel**: `run_isaac.py` renders ego RGB only;
-  run_mujoco's 2×2 combined video (map | chase | ego RGB | ego depth) is not
-  yet replicated for IsaacSim.
-- **Driver wiring**: `gen_trajectories.py` does not yet have a `--sim isaac`
-  option.
+- **2×2 combined panel**: `run_isaac.py` writes `ego_isaac` / `depth_isaac` /
+  `follow_isaac` as separate videos; run_mujoco's single 2×2 combined video
+  (map | chase | ego RGB | ego depth) is not replicated for IsaacSim.
+- **Driver wiring**: `gen_trajectories.py` has no `--sim isaac` option; the
+  IsaacSim runtime is invoked directly.
+- **procthor-objaverse asset coverage**: the objaverse MJCF object library is
+  an incomplete subset, so most procthor-objaverse scenes' MJCFs fail to
+  compile (a missing object) — only some scenes work end to end. The procthor
+  USD object library needed a `usd/scenes/objects/{thor,objaverse}` symlink.
 
 ## Working files
 
