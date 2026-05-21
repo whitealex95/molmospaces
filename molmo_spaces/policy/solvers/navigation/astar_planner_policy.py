@@ -220,7 +220,7 @@ class AStarPlannerPolicy(PlannerPolicy):
     def max_angle_waypoints(self, angles: np.ndarray) -> np.ndarray:
         assert angles.shape == (2, 1)
 
-        angle = float(abs(normalize_ang_error(angles[1] - angles[0])))
+        angle = float(abs(normalize_ang_error(angles[1] - angles[0])).item())
         num_points = int(np.ceil(angle / self.config.policy_config.path_max_inter_waypoint_angle))
         if num_points <= 1:
             # Enofrce always at least one orientation correction
@@ -497,7 +497,8 @@ class AStarSmoothPlannerPolicy(AStarPlannerPolicy):
             np.ceil(plan_length / self.config.policy_config.path_max_inter_waypoint_dist)
         )
 
-        tck, u = splprep(world_waypoints.transpose(), s=1e-5)
+        spline_degree = max(1, min(3, world_waypoints.shape[0] - 1))
+        tck, u = splprep(world_waypoints.transpose(), s=1e-5, k=spline_degree)
         u_new = np.linspace(0, 1, num_points)
         x_new, y_new = splev(u_new, tck)
 
