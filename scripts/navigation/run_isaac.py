@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""IsaacSim navigation runtime -- egocentric RGB + depth and a chase view.
+"""IsaacSim navigation runtime -- egocentric RGB + depth, a chase view, and a
+2x2 combined panel.
 
 Drives a Unitree G1 along an A* path (``path.npz`` from plan.py) through a USD
 scene and renders, per step, the robot's egocentric RGB + depth and a chase
 view -- the IsaacSim counterpart of run_mujoco.py. The occupancy grid and path
 are sim-agnostic, so the same ``path.npz`` drives both runtimes.
+
+Camera placement is identical to run_mujoco.py: the ego camera is rigidly
+mounted on the G1 torso (0.12 m forward, 0.42 m up, looking down robot +x); the
+chase camera tracks the pelvis from a fixed world offset equivalent to MuJoCo's
+azimuth 130 / elevation -55 / distance 6 tracking camera. Both cameras use a
+45 deg vertical field of view (MuJoCo's default camera fovy).
 
 Capture uses the ``isaacsim.sensors.camera`` Camera sensor in GUI mode (the
 headless camera-sensor path crashes here). The G1 and all cameras are created
@@ -16,7 +23,7 @@ pose math rejects. Needs a display:
       conda run -n mlspaces-isaac python run_isaac.py \\
         --scene scene.usda --path path.npz --out-dir OUT
 
-Output: ``<out-dir>/{ego_isaac,depth_isaac,follow_isaac}.mp4``.
+Output: ``<out-dir>/isaac_{ego,depth,follow,combined}.mp4`` (+ a montage png).
 
 See docs/navigation_pipeline.md and docs/isaac_navigation_log.md.
 """
@@ -35,6 +42,11 @@ ap = argparse.ArgumentParser(description=__doc__)
 ap.add_argument("--scene", required=True, help="USD scene (.usd/.usda)")
 ap.add_argument("--path", required=True, help="path.npz from plan.py")
 ap.add_argument("--out-dir", required=True, help="output directory")
+ap.add_argument(
+    "--occupancy",
+    default=None,
+    help="occupancy.npz for the combined map panel (default: found near path.npz)",
+)
 ap.add_argument("--g1", default=str(G1_USD), help="G1 USD (geometry layer)")
 ap.add_argument(
     "--robot-z", type=float, default=None, help="G1 base height (m); default: auto (feet on z=0)"
@@ -45,8 +57,6 @@ ap.add_argument("--dome-max", type=float, default=180.0, help="clamp scene DomeL
 ap.add_argument(
     "--distant-max", type=float, default=500.0, help="clamp scene DistantLight intensity"
 )
-ap.add_argument("--chase-z", type=float, default=3.0, help="chase camera height (m)")
-ap.add_argument("--chase-back", type=float, default=4.5, help="chase camera distance behind (m)")
 args = ap.parse_args()
 
 from isaacsim import SimulationApp  # noqa: E402
@@ -69,6 +79,18 @@ CAM_W, CAM_H = 1280, 960
 # rotation so the camera looks along the robot's +x (forward), +z up. Rows are
 # the camera's X/Y/Z axes expressed in the torso frame, then the translation.
 EGO_LOCAL = Gf.Matrix4d(0, -1, 0, 0, 0, 0, 1, 0, -1, 0, 0, 0, 0.12, 0, 0.42, 1)
+# chase camera: run_mujoco tracks the pelvis with a MuJoCo camera at azimuth
+# 130, elevation -55, distance 6. That is a fixed world-frame offset from the
+# tracked point -- measured straight off the MuJoCo camera (see the log).
+PELVIS_Z = 0.793  # G1 standing pelvis height -- the chase look-at point
+CHASE_OFFSET = np.array([2.206, -2.658, 4.826])  # eye = pelvis_point + this
+EGO_VFOV_DEG = 45.0  # MuJoCo's default camera fovy (vertical FOV)
+# g1_base.usd places its origin at the pelvis; the lowest geometry (the soles)
+# is 0.315 m below that -- measured from the asset's mesh extents. The mansion
+# and procthor converters both put the scene floor at z=0, so a base height of
+# 0.315 m rests the soles on the floor. (BBoxCache is unreliable on this
+# instanced USD -- it returns an empty bound -- so the value is a constant.)
+G1_GROUND_Z = 0.315
 
 
 def resample(wp, step):
@@ -127,10 +149,76 @@ def tame_lights(stage, dome_max, distant_max):
             print(f"  tamed {t} {prim.GetName()}: {cur} -> {cap}", flush=True)
 
 
+def set_camera_fov(stage, cam_path, vfov_deg, w, h):
+    """Set a USD camera's vertical FOV to match a MuJoCo camera fovy. focal
+    length and aperture are a ratio, so any consistent unit works."""
+    cam = UsdGeom.Camera(stage.GetPrimAtPath(cam_path))
+    f = 24.0
+    v_ap = 2.0 * f * float(np.tan(np.radians(vfov_deg) / 2.0))
+    cam.CreateFocalLengthAttr(f)
+    cam.CreateVerticalApertureAttr(v_ap)
+    cam.CreateHorizontalApertureAttr(v_ap * w / h)
+
+
 def colorize_depth(depth, near=0.1, far=8.0):
     d = np.clip(np.nan_to_num(np.asarray(depth), nan=far, posinf=far), near, far)
     norm = ((d - near) / (far - near) * 255).astype(np.uint8)
     return cv2.applyColorMap(255 - norm, cv2.COLORMAP_TURBO)
+
+
+def build_map_panel(occ_path, poses, pw, ph):
+    """Static 2D top-down layout panel (rooms tinted, trajectory drawn).
+    Returns the panel image and a world->panel-pixel function. Identical to
+    run_mujoco.build_map_panel so the combined panels line up."""
+    o = np.load(occ_path, allow_pickle=True)
+    occupancy = o["occupancy"]
+    room_map = o["room_map"]
+    room_names = o["room_names"]
+    w2m = o["world_to_map"]
+
+    img = np.where(occupancy[..., None], 235, 45).astype(np.uint8).repeat(3, axis=2)
+    n = max(len(room_names), 1)
+    hsv = np.stack(
+        [
+            np.linspace(0, 179, n, endpoint=False).astype(np.uint8),
+            np.full(n, 70, np.uint8),
+            np.full(n, 255, np.uint8),
+        ],
+        axis=1,
+    )
+    colors = cv2.cvtColor(hsv[None], cv2.COLOR_HSV2BGR)[0]
+    for i in range(1, n + 1):
+        img[room_map == i] = colors[i - 1]
+
+    traj = np.array([w2m @ np.array([x, y, 0.0, 1.0]) for x, y in poses])  # [row,col]
+    cv2.polylines(
+        img,
+        [np.stack([traj[:, 1], traj[:, 0]], 1).astype(np.int32)],
+        False,
+        (0, 150, 255),
+        5,
+        cv2.LINE_AA,
+    )
+
+    h, w = img.shape[:2]
+    s = min(pw / w, ph / h)
+    rw, rh = max(1, int(w * s)), max(1, int(h * s))
+    panel = np.full((ph, pw, 3), 255, np.uint8)
+    ox, oy = (pw - rw) // 2, (ph - rh) // 2
+    panel[oy : oy + rh, ox : ox + rw] = cv2.resize(img, (rw, rh), interpolation=cv2.INTER_AREA)
+
+    def world_to_panel(x, y):
+        rc = w2m @ np.array([x, y, 0.0, 1.0])
+        return (int(rc[1] * s + ox), int(rc[0] * s + oy))
+
+    return panel, world_to_panel
+
+
+def label(img, text):
+    out = img.copy()
+    cv2.rectangle(out, (0, 0), (img.shape[1], 26), (0, 0, 0), -1)
+    cv2.putText(out, text, (8, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    return out
 
 
 def write_video(path, frames, fps):
@@ -177,6 +265,18 @@ def write_video(path, frames, fps):
 def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # occupancy.npz drives the combined map panel. nav_runs puts it next to
+    # path.npz (procthor) or one level up, shared by a scene's trajectories
+    # (mansion) -- accept either.
+    if args.occupancy:
+        occ_path = Path(args.occupancy)
+    else:
+        near = Path(args.path).parent / "occupancy.npz"
+        occ_path = near if near.exists() else Path(args.path).parent.parent / "occupancy.npz"
+    do_combined = occ_path.exists()
+    if not do_combined:
+        print(f"  no occupancy.npz near {args.path}; combined panel skipped", flush=True)
 
     wp = np.load(args.path, allow_pickle=True)["waypoints"].astype(float)
     poses = smooth(resample(wp, 1.0 / args.fps), 45)
@@ -225,38 +325,42 @@ def main() -> int:
     ego.add_distance_to_image_plane_to_frame()
     chase = Camera(prim_path="/chase_cam", resolution=(CAM_W, CAM_H))
     chase.initialize()
+
+    # match MuJoCo's 45 deg vertical FOV on both cameras
+    set_camera_fov(stage, f"{torso_path}/ego_cam", EGO_VFOV_DEG, CAM_W, CAM_H)
+    set_camera_fov(stage, "/chase_cam", EGO_VFOV_DEG, CAM_W, CAM_H)
+
+    # warm up the renderer / camera sensors before capture
     for _ in range(40):
         world.step(render=True)
 
-    # place the G1 so its feet sit on the floor (z=0): the imported USD's origin
-    # is not at the soles. Derive the offset from the G1 geometry bbox -- done
-    # now (stage fully composed, /g1 still at the origin).
-    if args.robot_z is not None:
-        robot_z = args.robot_z
-    else:
-        bc = UsdGeom.BBoxCache(
-            Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render]
-        )
-        robot_z = -float(bc.ComputeWorldBound(g1).ComputeAlignedRange().GetMin()[2])
-        if not 0.05 < robot_z < 1.5:  # bbox came back empty/degenerate
-            print(f"  warn: bbox robot_z={robot_z:.3f} out of range; using 0.315", flush=True)
-            robot_z = 0.315
+    # base height that rests the G1 soles on the scene floor (see G1_GROUND_Z)
+    robot_z = args.robot_z if args.robot_z is not None else G1_GROUND_Z
     print(f"READY  (G1 base z = {robot_z:.3f})", flush=True)
 
-    ego_rgb, ego_depth, follow = [], [], []
+    map_base, world_to_panel = (None, None)
+    if do_combined:
+        map_base, world_to_panel = build_map_panel(occ_path, poses, 640, 480)
+
+    ego_rgb, ego_depth, follow, combined = [], [], [], []
     t0 = time.time()
     for fi, pi in enumerate(idx):
         x, y = poses[pi]
         a = float(yaws[pi])
-        ca, sa = np.cos(a), np.sin(a)
 
         # drive the G1; the ego camera is a child of the torso and rides along
         g1_t.Set(Gf.Vec3d(float(x), float(y), robot_z))
         g1_r.Set(float(np.degrees(a)))
 
+        # chase: fixed world offset from the pelvis point -- matches MuJoCo's
+        # azimuth/elevation/distance tracking camera (does not rotate with yaw)
         set_camera_view(
-            eye=[x - args.chase_back * ca, y - args.chase_back * sa, args.chase_z],
-            target=[x, y, 1.0],
+            eye=[
+                float(x + CHASE_OFFSET[0]),
+                float(y + CHASE_OFFSET[1]),
+                float(PELVIS_Z + CHASE_OFFSET[2]),
+            ],
+            target=[float(x), float(y), PELVIS_Z],
             camera_prim_path="/chase_cam",
         )
 
@@ -266,24 +370,55 @@ def main() -> int:
         er = np.asarray(ego.get_rgba())
         cr = np.asarray(chase.get_rgba())
         dep = ego.get_current_frame().get("distance_to_image_plane")
-        if er.size > 1:
-            ego_rgb.append(er[..., :3][..., ::-1].copy())
-        if cr.size > 1:
-            follow.append(cr[..., :3][..., ::-1].copy())
-        if dep is not None and np.asarray(dep).size > 1:
-            ego_depth.append(colorize_depth(dep))
+        if er.size <= 1 or cr.size <= 1 or dep is None or np.asarray(dep).size <= 1:
+            if fi % 40 == 0:
+                print(f"  frame {fi}/{len(idx)}: incomplete capture, skipped", flush=True)
+            continue
+        rgb = er[..., :3][..., ::-1].copy()
+        chs = cr[..., :3][..., ::-1].copy()
+        dpt = colorize_depth(dep)
+        ego_rgb.append(rgb)
+        follow.append(chs)
+        ego_depth.append(dpt)
+
+        if do_combined:
+            mp = map_base.copy()
+            dot = world_to_panel(x, y)
+            head = world_to_panel(x + 0.6 * np.cos(a), y + 0.6 * np.sin(a))
+            cv2.line(mp, dot, head, (40, 40, 40), 3, cv2.LINE_AA)
+            cv2.circle(mp, dot, 8, (0, 0, 230), -1, cv2.LINE_AA)
+            p6 = (640, 480)
+            top = np.hstack(
+                [
+                    label(mp, "Top-down map"),
+                    label(cv2.resize(chs, p6, interpolation=cv2.INTER_AREA), "Chase"),
+                ]
+            )
+            bot = np.hstack(
+                [
+                    label(cv2.resize(rgb, p6, interpolation=cv2.INTER_AREA), "Ego RGB"),
+                    label(cv2.resize(dpt, p6, interpolation=cv2.INTER_AREA), "Ego depth"),
+                ]
+            )
+            combined.append(np.vstack([top, bot]))
+
         if fi % 40 == 0:
             print(f"  frame {fi}/{len(idx)}  t={time.time() - t0:.1f}s", flush=True)
-    print(
-        f"captured ego_rgb={len(ego_rgb)} depth={len(ego_depth)} follow={len(follow)} "
-        f"in {time.time() - t0:.1f}s",
-        flush=True,
-    )
+    print(f"captured {len(ego_rgb)} frames in {time.time() - t0:.1f}s", flush=True)
 
-    write_video(out_dir / "ego_isaac.mp4", ego_rgb, args.fps)
-    write_video(out_dir / "depth_isaac.mp4", ego_depth, args.fps)
-    write_video(out_dir / "follow_isaac.mp4", follow, args.fps)
-    print(f"wrote ego_isaac.mp4 / depth_isaac.mp4 / follow_isaac.mp4 -> {out_dir}", flush=True)
+    write_video(out_dir / "isaac_ego.mp4", ego_rgb, args.fps)
+    write_video(out_dir / "isaac_depth.mp4", ego_depth, args.fps)
+    write_video(out_dir / "isaac_follow.mp4", follow, args.fps)
+    write_video(out_dir / "isaac_combined.mp4", combined, args.fps)
+
+    if combined:
+        sel = np.linspace(0, len(combined) - 1, 6).astype(int)
+        tiles = [cv2.resize(combined[i], (640, 480)) for i in sel]
+        sheet = np.vstack([np.hstack(tiles[0:3]), np.hstack(tiles[3:6])])
+        cv2.imwrite(str(out_dir / "isaac_combined_montage.png"), sheet)
+
+    made = ["isaac_ego", "isaac_depth", "isaac_follow"] + (["isaac_combined"] if combined else [])
+    print(f"wrote {'/'.join(made)}.mp4 -> {out_dir}", flush=True)
 
     app.close()
     return 0
