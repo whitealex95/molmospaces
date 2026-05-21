@@ -99,6 +99,13 @@ Verified:
   an incomplete subset, so most procthor-objaverse scenes' MJCFs fail to
   compile (a missing object) — only some scenes work end to end. The procthor
   USD object library needed a `usd/scenes/objects/{thor,objaverse}` symlink.
+  Measured (opened the USDs of 4 scenes whose MJCF failed): 3 of 4 have
+  **fully complete USDs** (`val_1413`, `val_3116`, `val_6469` — 0 missing
+  refs); only `val_1042` is incomplete in both (35 missing USD refs). So the
+  USD object library is substantially more complete than the MJCF one. The
+  real bottleneck for procthor-objaverse in IsaacSim is the MJCF —
+  `build_occupancy.py` needs it (MuJoCo render) for the occupancy + path.
+  Building occupancy from the USD directly would unlock those scenes.
 
 ## Working files
 
