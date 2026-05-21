@@ -39,6 +39,12 @@ ap.add_argument("--g1", default=str(G1_USD), help="G1 USD (geometry layer)")
 ap.add_argument("--robot-z", type=float, default=0.79, help="G1 root height (m)")
 ap.add_argument("--fps", type=int, default=30, help="output video frame rate")
 ap.add_argument("--max-frames", type=int, default=300, help="cap on rendered frames")
+ap.add_argument("--dome-max", type=float, default=180.0, help="clamp scene DomeLight intensity")
+ap.add_argument(
+    "--distant-max", type=float, default=500.0, help="clamp scene DistantLight intensity"
+)
+ap.add_argument("--chase-z", type=float, default=3.0, help="chase camera height (m)")
+ap.add_argument("--chase-back", type=float, default=4.5, help="chase camera distance behind (m)")
 args = ap.parse_args()
 
 from isaacsim import SimulationApp  # noqa: E402
@@ -100,6 +106,23 @@ def compute_yaws(poses, alpha=0.2):
         y += alpha * np.arctan2(np.sin(raw[i] - y), np.cos(raw[i] - y))
         out[i] = y
     return out
+
+
+def tame_lights(stage, dome_max, distant_max):
+    """Clamp over-bright scene lights. The procthor USD ships a 1000-intensity
+    DomeLight + DistantLight that wash the render out; the mansion USD has no
+    lights at all. This is a per-scene, code-side fix applied to an in-memory
+    session-layer override -- the USD asset on disk is never modified."""
+    for prim in stage.Traverse():
+        t = str(prim.GetTypeName())
+        if t not in ("DomeLight", "DistantLight"):
+            continue
+        cap = dome_max if t == "DomeLight" else distant_max
+        a = prim.GetAttribute("inputs:intensity")
+        cur = a.Get() if a and a.HasAuthoredValue() else None
+        if cur is not None and cur > cap:
+            a.Set(float(cap))
+            print(f"  tamed {t} {prim.GetName()}: {cur} -> {cap}", flush=True)
 
 
 def colorize_depth(depth, near=0.1, far=8.0):
@@ -166,6 +189,10 @@ def main() -> int:
     for _ in range(120):
         app.update()
     stage = ctx.get_stage()
+    # all edits (G1, cameras, light overrides) go to the in-memory session
+    # layer -- the scene USD file on disk is never modified
+    stage.SetEditTarget(stage.GetSessionLayer())
+    tame_lights(stage, args.dome_max, args.distant_max)
 
     # G1 at the stage root (referenced geometry layer -> static, no physics)
     g1 = stage.DefinePrim("/g1", "Xform")
@@ -212,7 +239,7 @@ def main() -> int:
         g1_r.Set(float(np.degrees(a)))
 
         set_camera_view(
-            eye=[x - 4.5 * ca, y - 4.5 * sa, 3.0],
+            eye=[x - args.chase_back * ca, y - args.chase_back * sa, args.chase_z],
             target=[x, y, 1.0],
             camera_prim_path="/chase_cam",
         )
