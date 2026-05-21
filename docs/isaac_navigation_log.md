@@ -60,7 +60,7 @@ navigation video — the IsaacSim counterpart of `run_mujoco.py`.
 - Minor artifact: the kinematic camera clips door panels for a few frames when
   crossing a doorway (no collision). Acceptable — same as run_mujoco.
 
-## Status — SOLVED for mansion
+## Status — SOLVED
 
 `scripts/navigation/run_isaac.py` produces IsaacSim egocentric navigation
 videos. Run it with the display env set:
@@ -71,7 +71,11 @@ DISPLAY=:20 XAUTHORITY=$HOME/.Xauthority \
     --scene <scene.usda> --path <path.npz> --out-dir <dir>
 ```
 
-Verified: `nav_runs/mansion/public_healthcare_3f_floor1/{01,02}__*/ego_isaac.mp4`.
+Verified:
+- **mansion** — all 10 trajectories rendered cleanly:
+  `nav_runs/mansion/public_healthcare_3f_floor1/*/ego_isaac.mp4`.
+- **procthor** — `val_308` renders frame-aligned (`nav_runs/procthor-10k-val/val_308/ego_isaac.mp4`)
+  but washed-out; see Remaining work.
 
 ## Remaining work / next steps
 
