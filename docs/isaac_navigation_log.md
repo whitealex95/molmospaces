@@ -80,15 +80,17 @@ DISPLAY=:20 XAUTHORITY=$HOME/.Xauthority \
 ```
 
 `run_isaac.py` renders, per step, the robot's **egocentric RGB + depth** and a
-**chase view**; the ego camera is rigidly mounted on the G1 torso.
+**chase view**; the ego camera is rigidly mounted on the G1 torso, and the G1
+stands on the floor (base z auto-derived from its geometry bbox).
 
 Verified:
 - **mansion** — all 10 trajectories. Mansion USD has no lights of its own;
   IsaacSim's default lighting renders it cleanly.
 - **procthor-10k-val** (`val_308`) — frame-aligned, furniture present, washout
   fixed by light taming.
-- **procthor-objaverse-val** (`val_1567`) — same; a 1-room scene (within-room
-  path).
+- **procthor-objaverse-val** — `val_1567` (MJCF compiles); and `val_1413`,
+  `val_3116`, `val_6469` via `build_occupancy_usd.py` (their MJCFs do not
+  compile, so the occupancy is built from the USD geometry instead).
 
 ## Remaining work / next steps
 
