@@ -17,20 +17,23 @@ scene .xml ─▶ build_occupancy.py ─▶ occupancy.npz   2D occupancy + room 
                                         │
 occupancy.npz ─▶ plan.py (Planner) ─▶ path.npz       A* world-frame waypoints
                                         │
-scene + path  ─▶ run_mujoco.py     ─▶ combined.mp4   G1 ego/chase video
+scene + path  ─▶ run_mujoco.py     ─▶ combined.mp4   G1 ego/chase video (MuJoCo)
+              └▶ run_isaac.py      ─▶ ego_isaac.mp4  egocentric video (IsaacSim)
 
-gen_trajectories.py orchestrates all three for N trajectories per scene.
+gen_trajectories.py orchestrates occupancy→plan→run_mujoco for N trajectories.
 ```
 
 | Script | Role |
 |---|---|
 | `build_occupancy.py` | scene MJCF → 2D occupancy + room-label grid |
 | `plan.py` | occupancy grid → clearance-aware A* path; reusable `Planner` class |
-| `run_mujoco.py` | scene + path → kinematic G1 + egocentric/chase render |
+| `run_mujoco.py` | scene + path → kinematic G1 + egocentric/chase render (MuJoCo) |
+| `run_isaac.py` | USD scene + path → egocentric camera render (IsaacSim) |
 | `gen_trajectories.py` | batch driver: N trajectories/scene, previews + index |
 
-The three stages are **sim-agnostic by design**: the occupancy grid is built
-in one world frame shared by the MuJoCo and (future) IsaacSim runtimes.
+The stages are **sim-agnostic by design**: the occupancy grid and the A* path
+are built in one world frame, so the same `path.npz` drives both the MuJoCo and
+the IsaacSim runtime.
 
 ## Inputs and environments
 
@@ -132,6 +135,32 @@ Scene + `path.npz` → the egocentric/chase video.
    `+faststart`) by piping frames to `ffmpeg` — OpenCV's `mp4v` is MPEG-4
    Part 2 whose Simple Profile caps near 1280×720 and fails to play on the web
    for the 1280×960 panel. Falls back to `mp4v` only if `ffmpeg` is absent.
+
+## Stage 3 (IsaacSim) — `run_isaac.py`
+
+The IsaacSim counterpart of `run_mujoco.py`: flies an egocentric camera along
+the same `path.npz` through a **USD** scene and renders `ego_isaac.mp4`. See
+`docs/isaac_navigation_log.md` for the full diagnostic history.
+
+1. **GUI mode, not headless** — `SimulationApp(headless=False)`. IsaacSim's
+   headless camera-sensor API crashes here (`IRenderSettings ... stage-id`);
+   GUI-mode viewport rendering is reliable. It therefore needs a display — run
+   with the Chrome Remote Desktop virtual display `:20`
+   (`DISPLAY=:20 XAUTHORITY=$HOME/.Xauthority`), in the `mlspaces-isaac` env.
+2. **Open the USD scene** — `omni.usd` `open_stage`. The path is reused as-is:
+   the mansion USD shares the mansion MJCF world frame (both converters apply
+   one convention). procthor USD frame-alignment is unverified.
+3. **Fly the camera** — reuse the `run_mujoco` path helpers (`resample`,
+   `smooth`, `compute_yaws`); per pose `set_camera_view(eye, target)` at eye
+   height 1.3 m, `app.update()`, then `capture_viewport_to_file` for a clean
+   per-frame PNG.
+4. **Assemble** — H.264 via the system `/usr/bin/ffmpeg` (with
+   `LD_LIBRARY_PATH` stripped, since the isaacsim env's libs break it). This
+   runs **before** `app.close()` — IsaacSim fast-shutdown can hard-exit the
+   process, so nothing after `close()` is guaranteed to run.
+
+Output: `<out-dir>/ego_isaac.mp4`. Currently ego RGB only; depth, a chase view,
+and the 2×2 combined panel are not yet replicated for IsaacSim.
 
 ## Driver — `gen_trajectories.py`
 
