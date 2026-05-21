@@ -44,6 +44,8 @@ navigation video — the IsaacSim counterpart of `run_mujoco.py`.
 | 1 | 2026-05-21 | GUI: load mansion USD, frame camera, screen-record `:20` | ✅ works | mansion USD loaded (1844 prims, bbox 19×17×3.5 m), viewport renders, screen-record captures it. No crash. |
 | 2 | 2026-05-21 | GUI: fly egocentric camera along A* path, `capture_viewport_to_file` per frame | ✅ works | 173 ego frames captured in 16 s, assembled to H.264 video. Frames 0/160 are clean egocentric room views; ~a few frames clip a door panel (kinematic camera, no collision — same artifact as run_mujoco). |
 | 3 | 2026-05-21 | Promote to `scripts/navigation/run_isaac.py` (self-contained: scene + path → `ego_isaac.mp4`) | ✅ works | Two bugs found + fixed: (a) ffmpeg ran after `app.close()`, which IsaacSim fast-shutdown hard-exits past — assemble *before* `close()`; (b) ffmpeg is not on the isaacsim env PATH and conda libs break the system binary — call `/usr/bin/ffmpeg` with `LD_LIBRARY_PATH` stripped. Verified on mansion trajectories 01 (173 frames) and 02 (441 frames). |
+| 4 | 2026-05-21 | Batch all 10 mansion trajectories | ✅ works | 10/10 `ego_isaac.mp4` rendered (165–538 frames each, ~15–44 s capture). |
+| 5 | 2026-05-21 | procthor `val_308` (USD + MJCF both on disk) — build occupancy/plan from MJCF, render in IsaacSim from USD | ✅ works (render washed-out) | procthor MJCF and USD **do share the world frame** — the ego camera flies the path correctly inside the building (floor / walls / windows / doors all in place). 438 frames, `ego_isaac.mp4` written. But the procthor USD renders **washed-out / over-bright** (pale hazy walls) where the mansion USD rendered cleanly — a procthor-USD lighting/materials issue, independent of `run_isaac.py`. |
 
 ## Key findings — IsaacSim rendering SOLVED
 
@@ -73,9 +75,13 @@ Verified: `nav_runs/mansion/public_healthcare_3f_floor1/{01,02}__*/ego_isaac.mp4
 
 ## Remaining work / next steps
 
-- **procthor**: `run_isaac.py` is scene-agnostic, but the procthor *USD* scenes
-  (`~/.molmospaces/usd/scenes/procthor-*`) must be confirmed to share the world
-  frame of the procthor *MJCF* the occupancy/path were built from. Untested.
+- **procthor render quality**: procthor works and is frame-aligned, but the
+  procthor USD renders washed-out/over-bright (pale hazy walls). Likely a
+  too-strong dome/environment light or unloaded wall materials in the procthor
+  USD. Needs investigation in the USD's lighting/material prims — independent
+  of `run_isaac.py`. Note: procthor USD scenes on disk (`val_308`, `val_565`,
+  …) do **not** overlap the downloaded procthor MJCF set (`val_0`–`4`); a
+  procthor IsaacSim run needs a scene present in both formats.
 - **Depth / chase / combined panel**: `run_isaac.py` renders ego RGB only;
   run_mujoco's 2×2 combined video (map | chase | ego RGB | ego depth) is not
   yet replicated for IsaacSim.
