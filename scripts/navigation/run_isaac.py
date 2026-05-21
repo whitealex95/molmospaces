@@ -36,7 +36,9 @@ ap.add_argument("--scene", required=True, help="USD scene (.usd/.usda)")
 ap.add_argument("--path", required=True, help="path.npz from plan.py")
 ap.add_argument("--out-dir", required=True, help="output directory")
 ap.add_argument("--g1", default=str(G1_USD), help="G1 USD (geometry layer)")
-ap.add_argument("--robot-z", type=float, default=0.79, help="G1 root height (m)")
+ap.add_argument(
+    "--robot-z", type=float, default=None, help="G1 base height (m); default: auto (feet on z=0)"
+)
 ap.add_argument("--fps", type=int, default=30, help="output video frame rate")
 ap.add_argument("--max-frames", type=int, default=300, help="cap on rendered frames")
 ap.add_argument("--dome-max", type=float, default=180.0, help="clamp scene DomeLight intensity")
@@ -225,7 +227,21 @@ def main() -> int:
     chase.initialize()
     for _ in range(40):
         world.step(render=True)
-    print("READY", flush=True)
+
+    # place the G1 so its feet sit on the floor (z=0): the imported USD's origin
+    # is not at the soles. Derive the offset from the G1 geometry bbox -- done
+    # now (stage fully composed, /g1 still at the origin).
+    if args.robot_z is not None:
+        robot_z = args.robot_z
+    else:
+        bc = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render]
+        )
+        robot_z = -float(bc.ComputeWorldBound(g1).ComputeAlignedRange().GetMin()[2])
+        if not 0.05 < robot_z < 1.5:  # bbox came back empty/degenerate
+            print(f"  warn: bbox robot_z={robot_z:.3f} out of range; using 0.315", flush=True)
+            robot_z = 0.315
+    print(f"READY  (G1 base z = {robot_z:.3f})", flush=True)
 
     ego_rgb, ego_depth, follow = [], [], []
     t0 = time.time()
@@ -235,7 +251,7 @@ def main() -> int:
         ca, sa = np.cos(a), np.sin(a)
 
         # drive the G1; the ego camera is a child of the torso and rides along
-        g1_t.Set(Gf.Vec3d(float(x), float(y), args.robot_z))
+        g1_t.Set(Gf.Vec3d(float(x), float(y), robot_z))
         g1_r.Set(float(np.degrees(a)))
 
         set_camera_view(
