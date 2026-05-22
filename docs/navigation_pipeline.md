@@ -38,11 +38,21 @@ the IsaacSim runtime.
 
 ## Inputs and environments
 
-- **Scenes** are MJCF `.xml` files. Mansion scenes come from
-  `scripts/mansion/mansion_to_mjcf.py` (see `docs/mansion_to_mjcf.md`);
+- **Scenes (MJCF)** — `.xml` files driving `run_mujoco.py`. Mansion scenes come
+  from `scripts/mansion/mansion_to_mjcf.py` (see `docs/mansion_to_mjcf.md`);
   procthor scenes are fetched with the molmospaces resource manager
   (`ResourceManager.install_packages("scenes", {...})`).
-- **Robot**: Unitree G1 — `~/Projects/CAMDM/PyTorch/visualize/assets/g1_29dof_rev_1_0.xml`.
+- **Scenes (USD)** — `.usda` files driving `run_isaac.py`:
+  - mansion — `~/Projects/mansion/usd_export/<floorplan>/floor_<N>/scene.usda`
+    (produced by `scripts/mansion/mansion_to_usd.py`, see `docs/mansion_to_usd.md`);
+    e.g. `~/Projects/mansion/usd_export/public_healthcare_3f_300_fp001_0/floor_1/scene.usda`.
+  - procthor — the molmospaces USD asset store at `~/.molmospaces/usd/scenes/`:
+    `~/.molmospaces/usd/scenes/<procthor-10k-val|procthor-objaverse-val>/<version>/<scene>/scene.usda`
+    (current version `20260128`).
+- **Robot**: Unitree G1 — MJCF
+  `~/Projects/CAMDM/PyTorch/visualize/assets/g1_29dof_rev_1_0.xml` (run_mujoco);
+  USD `~/Projects/CAMDM/PyTorch/visualize/assets/g1_isaac/configuration/g1_base.usd`
+  (run_isaac).
 - **Conda envs**:
   - `mlspaces-mujoco` — occupancy building, planning, OpenGL rendering
     (stock MuJoCo + classic OpenGL renderer).
@@ -242,15 +252,21 @@ topdown_png, combined_mp4`.
 Output tree:
 ```
 nav_runs/<dataset>/
-  index.json
+  index.json                          # gen_trajectories: one per dataset
   <scene>/
     occupancy.npz  occupancy_debug.png
-    NN__<start>__to__<goal>/
+    NN__<start>__to__<goal>/          # gen_trajectories: one dir per trajectory
       path.npz  path_debug.png  topdown.png
       combined.mp4  ego_rgb.mp4  ego_depth.mp4  follow.mp4  combined_montage.png
-      isaac_combined.mp4  isaac_ego.mp4  isaac_depth.mp4  isaac_follow.mp4
 ```
 `nav_runs/` lives at the repo root and is gitignored.
+
+`run_isaac.py` writes `isaac_{ego,depth,follow,combined}.mp4` +
+`isaac_combined_montage.png` into its `--out-dir`. It is invoked directly (not
+by `gen_trajectories.py`), so placement follows `--out-dir`: in the batches run
+so far that is each `NN__.../` trajectory subdir for mansion (one render per
+trajectory, beside the MuJoCo files) and the `<scene>/` dir itself for procthor
+(one render per scene, sharing that scene's `occupancy.npz` / `path.npz`).
 
 ## Tuning constants
 
@@ -299,4 +315,21 @@ python scripts/navigation/plan.py --occupancy <dir>/occupancy.npz --out <dir>/pa
     [--start-room NAME --goal-room NAME]          # inspect <dir>/path_debug.png
 python scripts/navigation/run_mujoco.py --scene <scene.xml> --path <dir>/path.npz \
     --occupancy <dir>/occupancy.npz --out-dir <dir>
+```
+
+IsaacSim render — `run_isaac.py` consumes the **USD** scene and the *same*
+sim-agnostic `path.npz` (occupancy + plan stages are unchanged). Run it in the
+`mlspaces-isaac` env, with the `:20` display:
+```bash
+DISPLAY=:20 XAUTHORITY=$HOME/.Xauthority \
+  conda run -n mlspaces-isaac python scripts/navigation/run_isaac.py \
+    --scene <scene.usda> --path <dir>/path.npz --out-dir <dir>
+```
+`--occupancy` is auto-found next to `path.npz` (it feeds the combined map
+panel). When a procthor-objaverse scene's MJCF will not compile, replace
+`build_occupancy.py` with the USD builder (same `mlspaces-isaac` env,
+byte-compatible output), then run `plan.py` and `run_isaac.py` as above:
+```bash
+conda run -n mlspaces-isaac python scripts/navigation/build_occupancy_usd.py \
+    --scene <scene.usda> --out <dir>/occupancy.npz
 ```
