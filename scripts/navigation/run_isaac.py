@@ -7,11 +7,10 @@ scene and renders, per step, the robot's egocentric RGB + depth and a chase
 view -- the IsaacSim counterpart of run_mujoco.py. The occupancy grid and path
 are sim-agnostic, so the same ``path.npz`` drives both runtimes.
 
-Camera placement is identical to run_mujoco.py: the ego camera is rigidly
-mounted on the G1 torso (0.12 m forward, 0.42 m up, looking down robot +x); the
-chase camera tracks the pelvis from a fixed world offset equivalent to MuJoCo's
-azimuth 130 / elevation -55 / distance 6 tracking camera. Both cameras use a
-45 deg vertical field of view (MuJoCo's default camera fovy).
+Camera placement matches run_mujoco.py: the ego camera is rigidly mounted on
+the G1 torso (0.12 m forward, 0.42 m up, looking down robot +x); the chase
+camera is an interior follow camera -- behind the robot and below the ceiling,
+looking at its mid-body. Both cameras use a 45 deg vertical FOV.
 
 Capture uses the ``isaacsim.sensors.camera`` Camera sensor in GUI mode (the
 headless camera-sensor path crashes here). The G1 and all cameras are created
@@ -79,11 +78,13 @@ CAM_W, CAM_H = 1280, 960
 # rotation so the camera looks along the robot's +x (forward), +z up. Rows are
 # the camera's X/Y/Z axes expressed in the torso frame, then the translation.
 EGO_LOCAL = Gf.Matrix4d(0, -1, 0, 0, 0, 0, 1, 0, -1, 0, 0, 0, 0.12, 0, 0.42, 1)
-# chase camera: run_mujoco tracks the pelvis with a MuJoCo camera at azimuth
-# 130, elevation -55, distance 6. That is a fixed world-frame offset from the
-# tracked point -- measured straight off the MuJoCo camera (see the log).
-PELVIS_Z = 0.793  # G1 standing pelvis height -- the chase look-at point
-CHASE_OFFSET = np.array([2.206, -2.658, 4.826])  # eye = pelvis_point + this
+# chase camera: an interior follow camera -- close behind and above the robot,
+# below the ceiling, looking down at its mid-body. A high external camera
+# cannot see into a ceilinged room; a far-behind camera clips through walls in
+# tight rooms, so it sits near-overhead. Same rule as run_mujoco.py.
+CHASE_BACK = 1.3  # m behind the robot, opposite its heading
+CHASE_Z = 2.3  # m camera height -- below the ~2.9 m procthor ceiling
+CHASE_LOOK_Z = 0.9  # m look-at height on the robot
 EGO_VFOV_DEG = 45.0  # MuJoCo's default camera fovy (vertical FOV)
 # g1_base.usd places its origin at the pelvis; the lowest geometry (the soles)
 # is 0.315 m below that -- measured from the asset's mesh extents. The mansion
@@ -352,15 +353,11 @@ def main() -> int:
         g1_t.Set(Gf.Vec3d(float(x), float(y), robot_z))
         g1_r.Set(float(np.degrees(a)))
 
-        # chase: fixed world offset from the pelvis point -- matches MuJoCo's
-        # azimuth/elevation/distance tracking camera (does not rotate with yaw)
+        # chase: interior follow camera, behind the robot and below the ceiling
+        ca, sa = np.cos(a), np.sin(a)
         set_camera_view(
-            eye=[
-                float(x + CHASE_OFFSET[0]),
-                float(y + CHASE_OFFSET[1]),
-                float(PELVIS_Z + CHASE_OFFSET[2]),
-            ],
-            target=[float(x), float(y), PELVIS_Z],
+            eye=[float(x - CHASE_BACK * ca), float(y - CHASE_BACK * sa), CHASE_Z],
+            target=[float(x), float(y), CHASE_LOOK_Z],
             camera_prim_path="/chase_cam",
         )
 

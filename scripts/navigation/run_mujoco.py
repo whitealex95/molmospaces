@@ -39,6 +39,14 @@ PELVIS_Z = 0.793  # G1 standing pelvis height above the floor
 EGO_W, EGO_H = 640, 480
 SMOOTH_WINDOW = 45  # path moving-average window (in resampled steps); collision-verified
 YAW_ALPHA = 0.2  # heading low-pass factor (smaller = smoother / more lag)
+# chase camera: interior follow camera -- close behind and above the robot,
+# below the ceiling, looking down at its mid-body (same rule as run_isaac.py).
+# Kept near-overhead so it does not clip through walls in tight rooms.
+CHASE_BACK = 1.3  # m behind the robot
+CHASE_Z = 2.3  # m camera height (below the ~2.9 m ceiling)
+CHASE_LOOK_Z = 0.9  # m look-at height on the robot
+CHASE_DIST = float(np.hypot(CHASE_BACK, CHASE_Z - CHASE_LOOK_Z))
+CHASE_ELEV = -float(np.degrees(np.arctan2(CHASE_Z - CHASE_LOOK_Z, CHASE_BACK)))
 
 
 def yaw_quat(yaw: float) -> np.ndarray:
@@ -254,12 +262,12 @@ def main() -> int:
     base_adr = model.joint("g1_floating_base_joint").qposadr[0]
 
     render = make_renderer(model, EGO_H, EGO_W, args.renderer)
+    # interior follow camera: behind the robot, below the ceiling (free camera;
+    # lookat + azimuth are set per frame so it tracks the robot's heading)
     followcam = mujoco.MjvCamera()
-    followcam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-    followcam.trackbodyid = model.body("g1_pelvis").id
-    followcam.distance = 6.0
-    followcam.azimuth = 130
-    followcam.elevation = -55
+    followcam.type = mujoco.mjtCamera.mjCAMERA_FREE
+    followcam.distance = CHASE_DIST
+    followcam.elevation = CHASE_ELEV
 
     map_base, world_to_panel = build_map_panel(occ_path, poses, EGO_W, EGO_H)
 
@@ -275,6 +283,8 @@ def main() -> int:
         depth = colorize_depth(render(data, "ego", depth=True))
         depth_frames.append(depth)
 
+        followcam.lookat[:] = [x, y, CHASE_LOOK_Z]
+        followcam.azimuth = float(np.degrees(yaw))
         follow = render(data, followcam)[:, :, ::-1].copy()
         follow_frames.append(follow)
 
