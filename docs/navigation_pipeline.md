@@ -26,7 +26,7 @@ gen_trajectories.py orchestrates occupancy→plan→run_mujoco for N trajectorie
 | Script | Role |
 |---|---|
 | `build_occupancy.py` | scene MJCF → 2D occupancy + room-label grid |
-| `build_occupancy_usd.py` | scene **USD** → the same grid (for scenes whose MJCF won't compile) |
+| `build_occupancy_usd.py` | scene **USD** → the same grid, USD-native (optional; no MJCF/MuJoCo) |
 | `plan.py` | occupancy grid → clearance-aware A* path; reusable `Planner` class |
 | `run_mujoco.py` | scene + path → kinematic G1 + egocentric/chase render (MuJoCo) |
 | `run_isaac.py` | USD scene + path → G1 egocentric RGB+depth + chase render (IsaacSim) |
@@ -98,15 +98,22 @@ is applied later, at planning time, so one grid serves any robot radius.
 
 ### Stage 1 (USD) — `build_occupancy_usd.py`
 
-Some procthor-objaverse scenes have an incomplete MJCF (the objaverse MJCF
-object library is a partial subset, so a missing object breaks compilation)
-but a complete USD. `build_occupancy_usd.py` builds the *same* `occupancy.npz`
-straight from the USD geometry: it reads the scene's `Geometry` scope, then
+`build_occupancy_usd.py` builds the *same* `occupancy.npz` straight from a
+scene's USD geometry — an optional alternative to `build_occupancy.py` that
+needs no MuJoCo and no MJCF. It reads the scene's `Geometry` scope and
 rasterizes the `room_N_visual_0` floor meshes (free + room id), the
 `wall_*_visual_0` wall meshes (obstacle), the furniture/decor Xform bboxes
 (obstacle), and carves the `doorway_*` footprints back open. Pure
 `pxr` + numpy + cv2 — no render. Run it in the `mlspaces-isaac` env; the
 output is byte-compatible, so `plan.py` and `run_isaac.py` are unchanged.
+
+Prefer the MJCF route (`build_occupancy.py`) when you can — one occupancy grid
+then drives *both* sims. A procthor-objaverse MJCF only needs its objaverse
+objects on disk first: they are not all bulk-downloaded by default, so install
+them per scene with `install_scene_with_objects_and_grasps_from_path` (see
+`docs/assets.md`). That clears the `Error opening file
+.../objaverse/<uid>/<uid>_visual.obj` compile failure. Use
+`build_occupancy_usd.py` for a USD-only workflow, or to skip MuJoCo entirely.
 
 ## Stage 2 — `plan.py` / `Planner`
 
@@ -326,9 +333,12 @@ DISPLAY=:20 XAUTHORITY=$HOME/.Xauthority \
     --scene <scene.usda> --path <dir>/path.npz --out-dir <dir>
 ```
 `--occupancy` is auto-found next to `path.npz` (it feeds the combined map
-panel). When a procthor-objaverse scene's MJCF will not compile, replace
-`build_occupancy.py` with the USD builder (same `mlspaces-isaac` env,
-byte-compatible output), then run `plan.py` and `run_isaac.py` as above:
+panel). occupancy + path are sim-agnostic: a scene's MJCF-derived
+`occupancy.npz` / `path.npz` (Stages 1–2) drive run_isaac directly, so MuJoCo
+and IsaacSim share one grid. If a procthor-objaverse MJCF errors with a missing
+`objaverse/<uid>` file, install the scene's objects first (see Stage 1 /
+`docs/assets.md`). For a USD-only workflow, build the occupancy from the USD
+instead (same `mlspaces-isaac` env, byte-compatible output):
 ```bash
 conda run -n mlspaces-isaac python scripts/navigation/build_occupancy_usd.py \
     --scene <scene.usda> --out <dir>/occupancy.npz

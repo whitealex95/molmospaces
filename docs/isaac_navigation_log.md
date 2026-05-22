@@ -51,10 +51,11 @@ navigation video — the IsaacSim counterpart of `run_mujoco.py`.
 | 8 | 2026-05-21 | run_isaac.py rewrite — depth + G1 + chase | ✅ works | Camera sensors (`/ego_cam`, `/chase_cam`) at root, G1 at `/g1` driven per frame. Produces `ego_isaac.mp4` + `depth_isaac.mp4` + `follow_isaac.mp4`. G1 renders standing correctly; depth is coherent. Known: the ego RGB shows black void above the walls (the mansion scene has no ceiling — an environment/lighting item for the per-scene lighting pass). |
 | 9 | 2026-05-21 | Ego camera rigidly mounted on the G1 torso | ✅ works | The ego `Camera` is created as a child of `/g1/pelvis/torso_link` with a fixed local transform (0.12 m fwd + 0.42 m up, looking along +x) — same mount as run_mujoco. It rides the robot; only `/g1` is driven per frame. Verified: head-height first-person views, no self-occlusion. |
 | 10 | 2026-05-21 | procthor-10k-val (`val_308`) in IsaacSim with the new runtime | ✅ works | Three procthor-specific fixes: (a) the procthor USD references `objects/thor` / `objects/objaverse` at `usd/scenes/objects/...` — symlinked those to `usd/objects/<src>/20260128` (no dataset content changed); (b) **light taming** — the procthor USD ships a 1000-intensity DomeLight + DistantLight; `run_isaac.py` clamps them via a session-layer override (`--dome-max` 180, `--distant-max` 500), fixing the washout; (c) the procthor USD has a ceiling, so the chase camera is lowered below it (`--chase-z` / `--chase-back`). Furniture, lighting, ego/depth/chase all render correctly. |
-| 11 | 2026-05-21 | procthor-objaverse-val (`val_1567`) in IsaacSim | ✅ works | A procthor-objaverse scene needs both a USD (for the render) and an MJCF that compiles (for occupancy/plan). The objaverse MJCF object library is an incomplete subset, so most scenes' MJCFs fail on a missing object — of 4 candidates with USDs, only `val_1567` compiled. It is a 1-room scene → within-room path (via `Planner` / `sample_trajectories`). Renders correctly with the same procthor flags. |
+| 11 | 2026-05-21 | procthor-objaverse-val (`val_1567`) in IsaacSim | ✅ works | A procthor-objaverse scene needs both a USD (for the render) and an MJCF that compiles (for occupancy/plan). It is a 1-room scene → within-room path (via `Planner` / `sample_trajectories`). Renders correctly with the same procthor flags. **[The "objaverse MJCF object library is an incomplete subset" claim made here is wrong — superseded by trial 15: the MJCFs do compile once the scene's objects are installed.]** |
 | 12 | 2026-05-21 | Fix the floating G1 | ✅ fixed | The G1 floated ~0.47 m above the floor: `--robot-z` was 0.79, but the imported G1 USD's foot soles are at z=−0.315 from its origin (vs MuJoCo, where base z 0.793 lands the feet on the floor). Fix: `run_isaac.py` auto-derives the base z from the G1 geometry bbox (`-bbox.min.z`) so the soles sit on z=0 — computed after warm-up (the bbox is empty if queried before the reference composes). Verified: the G1 stands on the floor. |
-| 13 | 2026-05-21 | USD-based occupancy (`build_occupancy_usd.py`) for scenes whose MJCF won't compile | ✅ works | The MJCF route can't build occupancy for procthor-objaverse scenes with incomplete MJCFs. `build_occupancy_usd.py` rasterizes the occupancy straight from the USD geometry — `room_N_visual_0` floors, `wall_*_visual_0` walls, `doorway_*` carves, and furniture/decor Xform bboxes as obstacles. Output is byte-compatible with `build_occupancy.py`. Verified end-to-end on `val_1413`: occupancy (4 rooms, all connected) → `plan.py` (10.6 m cross-room path) → `run_isaac.py` videos. |
+| 13 | 2026-05-21 | USD-based occupancy (`build_occupancy_usd.py`), a USD-native alternative | ✅ works | `build_occupancy_usd.py` rasterizes the occupancy straight from the USD geometry — `room_N_visual_0` floors, `wall_*_visual_0` walls, `doorway_*` carves, and furniture/decor Xform bboxes as obstacles. Output is byte-compatible with `build_occupancy.py`. Verified end-to-end on `val_1413`: occupancy (4 rooms, all connected) → `plan.py` (10.6 m cross-room path) → `run_isaac.py` videos. **[Built to work around "MJCFs won't compile" — but trial 15 shows the MJCFs *do* compile once objects are installed, so this is an optional USD-native tool, not a necessity.]** |
 | 14 | 2026-05-21 | Align run_isaac cameras with run_mujoco; add the 2×2 combined; rename outputs | ✅ done | Measured run_mujoco's chase camera (`mjCAMERA_TRACKING` at azimuth 130 / elevation -55 / distance 6) — it is a fixed world offset `(2.21, -2.66, 4.83)` from the tracked pelvis. `run_isaac.py` now places `/chase_cam` at that exact offset and sets both cameras to a 45° vertical FOV (MuJoCo's default fovy). Added the per-frame 2×2 `isaac_combined.mp4` (top-down map \| chase \| ego RGB \| ego depth) + montage; outputs renamed `isaac_{ego,depth,follow,combined}.mp4`. Grounding: the bbox auto-detect (trial 12) returns an *empty* bound on the instanced G1 USD, so it was always falling back — replaced with the measured constant `G1_GROUND_Z = 0.315` (the mansion and procthor floors are both at z=0). The user's "still floating" report was the mansion `nav_runs` videos predating trial 12; regenerating all 15 renders grounds them. Both procthor and mansion USDs are open-top (no ceiling), so the high MuJoCo chase needs no per-scene tuning. |
+| 15 | 2026-05-22 | procthor-objaverse MJCFs *do* compile — the trial-11/13 "incomplete library" diagnosis was wrong | ✅ corrected | The `Error opening file ../../objects/objaverse/<uid>/<uid>_visual.obj` failures were **not** a broken object library — the objects were simply **not installed**. The bulk download had 126 398 of ~129 k objaverse objects; each procthor-objaverse-val scene needs a handful from the missing ~2 %. The documented per-scene installer `install_scene_with_objects_and_grasps_from_path` (`docs/assets.md`) fetches exactly the missing UIDs. Ran it for all 10 procthor-objaverse-val scenes in play (`val_0`–`val_4`, `val_1042`, `val_1413`, `val_1567`, `val_3116`, `val_6469`) — **10/10 now compile** (343–3587 geoms). So the MJCF nav route works for procthor-objaverse; `build_occupancy_usd.py` is an optional USD-native alternative, not a necessity. Re-verified the full MJCF route (`build_occupancy.py` → `plan.py` → `run_mujoco.py` → `run_isaac.py` on the shared MJCF-derived occupancy) on `val_1413` and `val_3116`. |
 
 ## Key findings — IsaacSim rendering SOLVED
 
@@ -89,27 +90,23 @@ Verified:
   IsaacSim's default lighting renders it cleanly.
 - **procthor-10k-val** (`val_308`) — frame-aligned, furniture present, washout
   fixed by light taming.
-- **procthor-objaverse-val** — `val_1567` (MJCF compiles); and `val_1413`,
-  `val_3116`, `val_6469` via `build_occupancy_usd.py` (their MJCFs do not
-  compile, so the occupancy is built from the USD geometry instead).
+- **procthor-objaverse-val** — all 10 scenes in play (`val_0`–`val_4`,
+  `val_1042`, `val_1413`, `val_1567`, `val_3116`, `val_6469`). Their MJCFs
+  compile once the scene's objaverse objects are installed
+  (`install_scene_with_objects_and_grasps_from_path`, see trial 15), so the
+  standard MJCF occupancy route works; `build_occupancy_usd.py` is an optional
+  USD-native alternative.
 
 ## Remaining work / next steps
 
 - **Driver wiring**: `gen_trajectories.py` has no `--sim isaac` option; the
   IsaacSim runtime is invoked directly.
-- **procthor-objaverse asset coverage**: the objaverse MJCF object library is
-  an incomplete subset, so most procthor-objaverse scenes' MJCFs fail to
-  compile (a missing object) — only some scenes work end to end. The procthor
-  USD object library needed a `usd/scenes/objects/{thor,objaverse}` symlink.
-  Measured (opened the USDs of 4 scenes whose MJCF failed): 3 of 4 have
-  **fully complete USDs** (`val_1413`, `val_3116`, `val_6469` — 0 missing
-  refs); only `val_1042` is incomplete in both (35 missing USD refs). So the
-  USD object library is substantially more complete than the MJCF one. The
-  real bottleneck for procthor-objaverse in IsaacSim is the MJCF —
-  `build_occupancy.py` needs it (MuJoCo render) for the occupancy + path.
-  `build_occupancy_usd.py` (trial 13) builds the occupancy from the USD
-  directly and unlocks those scenes — done for `val_1413`, `val_3116`,
-  `val_6469`.
+- **procthor object install**: a procthor scene's objaverse objects must be on
+  disk before its MJCF will compile — not all are bulk-downloaded by default.
+  Install them per scene with `install_scene_with_objects_and_grasps_from_path`
+  (see trial 15 / `docs/assets.md`). The procthor USD object library is
+  separate and needs the `usd/scenes/objects/{thor,objaverse}` symlink (trial
+  10).
 
 ## Working files
 
