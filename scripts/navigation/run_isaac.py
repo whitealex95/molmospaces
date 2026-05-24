@@ -91,26 +91,21 @@ CHASE_BACK = 1.3  # m behind the robot, opposite its heading
 CHASE_Z = 2.3  # m camera height -- below the ~2.9 m procthor ceiling
 CHASE_LOOK_Z = 0.9  # m look-at height on the robot
 EGO_VFOV_DEG = 45.0  # MuJoCo's default camera fovy (vertical FOV)
-# G1 base z when spawned. Verified empirically in both mansion and procthor
-# scenes (side-on close-up render with a yellow reference line at world z=0;
-# pick the base z that puts the rendered feet flush with the line). z=0 grounds
-# the feet in both; z=0.315 (the prior value, derived from a static BBox of the
-# knee mesh) floats the robot ~26 cm above the floor.
+# G1 base z when spawned. With the static g1_base.usd (no articulation,
+# no joints, no rigid bodies -- verified via UsdPhysics queries), every link
+# mesh sits at the root xform with identity local transforms. z=0 grounds the
+# visible silhouette (foot mesh tops out near local z=0; floor occlusion hides
+# the knee/shin mesh that extends to local z=-0.315). See commit e3cea13 and
+# the section below for why z=0 looks right despite being kinematically wrong.
 #
-# Why z=0 looks right despite being kinematically wrong:
-#   g1_base.usd is a STATIC pile of link meshes -- no PhysicsArticulationRoot,
-#   no joints, no rigid bodies, no collision (verified via UsdPhysics queries).
-#   Every link's xform is identity, so all meshes overlap at the root xform.
-#   The foot mesh tops out near local z=0 while the knee/shin mesh extends to
-#   local z=-0.315. At base z=0 the visible silhouette reads as a humanoid
-#   standing on the floor because floor occlusion hides the parts of the pile
-#   that extend below z=0; the foot mesh sits right at the floor.
-#
-# This is a visual-only workaround. The right fix is to swap g1_base.usd for a
-# G1 USD that DOES author the kinematic chain + articulation (e.g. the Isaac
-# Lab G1 asset, which the IsaacLab G1 examples use). With that, set this back
-# to the URDF pelvis height (~0.793, matching run_mujoco.py's PELVIS_Z) and
-# let the articulation pose hip->knee->ankle->foot so feet land on z=0.
+# Attempted upgrade (2026-05-24) to the gamediscovery Isaac Lab dual_g1 g1.usd
+# (which DOES have 30 joints + 31 RigidBodies + 1 ArticulationRoot) failed:
+# raw stage.AddPayload + stage.Load brings in the scopes (joints, robot, Looks)
+# but 0 meshes resolve. That composition appears to require Isaac Lab's
+# UsdFileCfg high-level spawn API; raw IsaacSim payload resolution from a
+# consuming stage does not pull in the per-link visual meshes. Switching to
+# that asset would require routing through isaaclab.sim.spawners.UsdFileCfg
+# instead of stage.DefinePrim + GetPayloads.AddPayload, which is non-trivial.
 G1_GROUND_Z = 0.0
 
 
@@ -155,8 +150,10 @@ def compute_yaws(poses, alpha=0.2):
 
 def tame_lights(stage, dome_max, distant_max):
     """Clamp over-bright scene lights. The procthor USD ships a 1000-intensity
-    DomeLight + DistantLight that wash the render out; the mansion USD has no
-    lights at all. This is a per-scene, code-side fix applied to an in-memory
+    DomeLight + DistantLight that wash the render out; the mansion USD authors
+    a DistantLight (from proceduralParameters.lights) + per-room SphereLights
+    -- only the DistantLight is clamped here (SphereLights are local and don't
+    need taming). This is a per-scene, code-side fix applied to an in-memory
     session-layer override -- the USD asset on disk is never modified."""
     for prim in stage.Traverse():
         t = str(prim.GetTypeName())
