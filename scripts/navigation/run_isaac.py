@@ -74,10 +74,15 @@ from isaacsim.sensors.camera import Camera  # noqa: E402
 from pxr import Gf, Usd, UsdGeom  # noqa: E402
 
 CAM_W, CAM_H = 1280, 960
-# ego camera local transform on the G1 torso: 0.12 m forward + 0.42 m up, and a
-# rotation so the camera looks along the robot's +x (forward), +z up. Rows are
-# the camera's X/Y/Z axes expressed in the torso frame, then the translation.
-EGO_LOCAL = Gf.Matrix4d(0, -1, 0, 0, 0, 0, 1, 0, -1, 0, 0, 0, 0.12, 0, 0.42, 1)
+# Camera at the Realsense D435 mount position from the G1 URDF (d435_link
+# fixed joint off torso_link), but with the URDF's 47.6° downward pitch
+# REMOVED so the camera looks horizontally forward. The real D435 tilts down
+# for manipulation, but a forward-facing view is far more useful for
+# navigation — the agent can see what's ahead instead of staring at its own
+# arms and the floor. USD GfMatrix4d is row-major with v_world = v_local * M;
+# rows 0..2 are the camera-frame basis vectors expressed in the torso frame,
+# row 3 is the translation. Camera looks +x forward, +z world-up.
+EGO_LOCAL = Gf.Matrix4d(0, -1, 0, 0, 0, 0, 1, 0, -1, 0, 0, 0, 0.0576235, 0.01753, 0.42987, 1)
 # chase camera: an interior follow camera -- close behind and above the robot,
 # below the ceiling, looking down at its mid-body. A high external camera
 # cannot see into a ceilinged room; a far-behind camera clips through walls in

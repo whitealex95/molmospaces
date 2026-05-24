@@ -118,14 +118,22 @@ def build_model(scene_xml: Path, g1_xml: Path, backend: str = "opengl"):
     torso = scene.body("g1_torso_link")
     cam = torso.add_camera()
     cam.name = "ego"
-    cam.pos = [0.12, 0.0, 0.42]
-    cam.quat = [0.5, 0.5, -0.5, -0.5]  # look along +x (forward), +z world-up
+    # Camera at the Realsense D435 mount position from the G1 URDF (d435_link
+    # fixed joint off torso_link), but with the URDF's 47.6° downward pitch
+    # REMOVED so the camera looks horizontally forward. The real D435 tilts
+    # down for manipulation, but a forward-facing view is far more useful for
+    # navigation — the agent can see what's ahead instead of staring at its
+    # own arms and the floor. URDF pose was:
+    #   <origin xyz="0.0576235 0.01753 0.42987" rpy="0 0.8307767239493009 0"/>
+    # We keep xyz, drop rpy, so the camera looks +x forward, +z world-up.
+    cam.pos = [0.0576235, 0.01753, 0.42987]
+    cam.quat = [0.5, 0.5, -0.5, -0.5]
 
     if backend == "filament":
         lamp = torso.add_light()
         lamp.name = "ego_lamp"
         lamp.type = mujoco.mjtLightType.mjLIGHT_DIRECTIONAL
-        lamp.pos = [0.12, 0.0, 0.42]
+        lamp.pos = [0.0576235, 0.01753, 0.42987]
         lamp.dir = [1.0, 0.0, -0.15]  # robot-forward, slightly down
         lamp.diffuse = [2.5, 2.5, 2.5]  # bright: Filament has no headlight fill
         lamp.specular = [0.1, 0.1, 0.1]
