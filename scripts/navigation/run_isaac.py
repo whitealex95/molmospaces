@@ -86,12 +86,27 @@ CHASE_BACK = 1.3  # m behind the robot, opposite its heading
 CHASE_Z = 2.3  # m camera height -- below the ~2.9 m procthor ceiling
 CHASE_LOOK_Z = 0.9  # m look-at height on the robot
 EGO_VFOV_DEG = 45.0  # MuJoCo's default camera fovy (vertical FOV)
-# g1_base.usd places its origin at the pelvis; the lowest geometry (the soles)
-# is 0.315 m below that -- measured from the asset's mesh extents. The mansion
-# and procthor converters both put the scene floor at z=0, so a base height of
-# 0.315 m rests the soles on the floor. (BBoxCache is unreliable on this
-# instanced USD -- it returns an empty bound -- so the value is a constant.)
-G1_GROUND_Z = 0.315
+# G1 base z when spawned. Verified empirically in both mansion and procthor
+# scenes (side-on close-up render with a yellow reference line at world z=0;
+# pick the base z that puts the rendered feet flush with the line). z=0 grounds
+# the feet in both; z=0.315 (the prior value, derived from a static BBox of the
+# knee mesh) floats the robot ~26 cm above the floor.
+#
+# Why z=0 looks right despite being kinematically wrong:
+#   g1_base.usd is a STATIC pile of link meshes -- no PhysicsArticulationRoot,
+#   no joints, no rigid bodies, no collision (verified via UsdPhysics queries).
+#   Every link's xform is identity, so all meshes overlap at the root xform.
+#   The foot mesh tops out near local z=0 while the knee/shin mesh extends to
+#   local z=-0.315. At base z=0 the visible silhouette reads as a humanoid
+#   standing on the floor because floor occlusion hides the parts of the pile
+#   that extend below z=0; the foot mesh sits right at the floor.
+#
+# This is a visual-only workaround. The right fix is to swap g1_base.usd for a
+# G1 USD that DOES author the kinematic chain + articulation (e.g. the Isaac
+# Lab G1 asset, which the IsaacLab G1 examples use). With that, set this back
+# to the URDF pelvis height (~0.793, matching run_mujoco.py's PELVIS_Z) and
+# let the articulation pose hip->knee->ankle->foot so feet land on z=0.
+G1_GROUND_Z = 0.0
 
 
 def resample(wp, step):
