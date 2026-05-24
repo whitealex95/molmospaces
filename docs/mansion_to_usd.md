@@ -143,6 +143,7 @@ to 5 decimal places (max Δ = 0.00000 m).
 | Feature | status | Notes |
 |---|---|---|
 | Floor per room | ✅ | Single n-gon `UsdGeom.Mesh` face per `rooms[].floorPolygon` |
+| Ceiling per room | ✅ | Each room's `floorPolygon` re-emitted at `y = max(wall.polygon.y)` under `/World/Ceilings/ceiling_<roomid>`; `doubleSided=True` so the underside is visible from inside the room |
 | Walls | ✅ | Triangulated mesh per `walls[].polygon`; **cut at door/window holes** via rectangle-minus-rectangles strip decomposition (see mjcf doc §D, §F) |
 | Objects (objathor UID, `.pkl.gz`) | ✅ | Baked to `<uid>.usda` with mesh + albedo texture |
 | Objects (mansion_patch, `.json`) | ✅ | `small_stair`, `toilet-suite`, `elevator_panel_*` baked the same way |
@@ -152,8 +153,8 @@ to 5 decimal places (max Δ = 0.00000 m).
 | Wall cutouts | ✅ | Hole world corners computed from segment endpoints + `holePolygon` y range, projected into each wall's frame so coincident interior walls cut at the same world position. |
 | Objathor anchor offset | ✅ | bbox-center subtracted (rotated by per-instance ry + yRotOffset) so meshes sit on the floor instead of floating by half-height. |
 | `yRotOffset` | ✅ | Read from objathor pkl and added to per-instance `rotation.y` (12 of 65 objathor assets in this scene have non-zero values). |
-| Lights | ❌ | No lights authored; viewer fallback only |
-| Skybox / dome | ❌ | `proceduralParameters.skyboxId` ignored |
+| Lights | ✅ | `proceduralParameters.lights` → `UsdLux.DistantLight` (directional) + `UsdLux.SphereLight` (point), authored under `/World/Lights`. Intensity multipliers are `_DIR_LIGHT_INTENSITY_MULT = 1000`, `_POINT_LIGHT_INTENSITY_MULT = 300000` in `mansion_to_usd.py` — tweak there if scenes look dim/blown out. Unity directional emits along +Z while USD distant emits along -Z, so the converter adds a `RotateY 180` to flip. Spot lights are warned and skipped (no instances seen in audited floors). |
+| Skybox / ambient dome | 🟡 partial | When `proceduralParameters.skyboxId` is set, a synthetic neutral-white `UsdLux.DomeLight` is authored under `/World/Lights/ambient_dome` at `_DOME_LIGHT_INTENSITY = 1000` (clamped to 180 by `run_isaac.py`'s `tame_lights`, matching procthor's render-time intensity). The Unity skybox name (e.g. `SkyAlbany`) is *not yet* used as a texture — procthor's `Payload/Contents.usda` references `Textures/SkyAlbany.png` on its dome to get HDR-style IBL through windows; mansion's dome is currently uniform fill only. See §6 for the texture-IBL TODO. |
 | Materials beyond albedo | ❌ | `normal.jpg`, `emission.jpg`, `metallic_smoothness.jpg` are unused |
 | Collisions / physics | ❌ | Visual mesh only; no `UsdPhysics.CollisionAPI` |
 
@@ -176,7 +177,9 @@ Running the Section 3 command on
 Summary line printed at the end:
 
 ```
-wrote .../scene.usda  (rooms=7 walls=82 objects=144/144 doors=7/7 windows=13/13)
+wrote .../scene.usda  (rooms=7 walls=82 objects=144/144 doors=7/7 windows=13/13 lights=8/8)
+INFO mansion_to_usd: ceilings authored: 7 (y=3.200)
+INFO mansion_to_usd: lights authored: 8/8
 ```
 
 `conversion_report.json`:
@@ -186,7 +189,8 @@ wrote .../scene.usda  (rooms=7 walls=82 objects=144/144 doors=7/7 windows=13/13)
   "n_objects_total": 144, "n_objects_placed": 144, "n_objects_skipped": 0,
   "n_doors_total": 7,     "n_doors_placed": 7,
   "n_windows_total": 13,  "n_windows_placed": 13,
-  "n_rooms": 7, "n_walls": 82,
+  "n_rooms": 7, "n_walls": 82, "n_ceilings": 7,
+  "n_lights_total": 8, "n_lights_authored": 8,
   "unique_assetids": 85, "baked_assets": 67, "referenced_assets": 18,
   "missing_assetids": [], "skipped_objects": []
 }
@@ -267,10 +271,22 @@ Step-by-step for a different building / floor:
 - **No physics.** Add `UsdPhysics.CollisionAPI` per mesh (or a per-asset
   collider mesh from the `colliders` field already inside the `.pkl.gz`) to
   make scenes usable with PhysX/Newton.
-- **No lights.** `proceduralParameters.lights` carries an array of
-  Unity point lights; convert to `UsdLux.SphereLight`. `skyboxId` could map
-  to a `UsdLux.DomeLight` texture (mansion stores no skybox texture in the
-  patch, so this needs a separate asset source).
+- **Lights are authored** (Unity `directional` → `UsdLux.DistantLight`, `point`
+  → `UsdLux.SphereLight`), but the intensity multipliers (1000× for
+  directional, 300000× for point) are empirical — adjust the `_*_INTENSITY_MULT`
+  constants at the top of the "Lights" section in
+  `scripts/mansion/mansion_to_usd.py` if scenes render dim or blown out.
+  Spot lights are skipped (no instances seen in audited floors); add a
+  `_author_spot_light` helper when one appears.
+- **DomeLight is authored but not yet textured.** When `proceduralParameters.skyboxId`
+  is set the converter writes a neutral-white `UsdLux.DomeLight` to fill ambient
+  shadow regions. The skyboxId names (`SkyAlbany`, `SkyAlbanyHill`, `SkyGasworks`,
+  …) are the *same* names procthor uses for its dome textures — see
+  `~/.molmospaces/usd/scenes/procthor-10k-val/20260128/<scene>_ceiling/Payload/Textures/SkyAlbany.png`.
+  Wiring those PNGs into the mansion dome would give true IBL (sky pouring in
+  through windows) and bridge the remaining brightness gap with procthor.
+  TODO: copy / symlink the matching texture into `usd_export/<scene>/Textures/`
+  and set `inputs:texture:file = @./Textures/<skyboxId>.png@` on the dome.
 - **Walls and floors share z=0**, which causes z-fighting along the wall
   bases. Either thicken walls into boxes (preferred) or offset the floor
   slightly.

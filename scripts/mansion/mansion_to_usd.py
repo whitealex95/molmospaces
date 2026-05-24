@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdShade
 
 LOG = logging.getLogger("mansion_to_usd")
 
@@ -616,6 +616,212 @@ def _add_polygon_mesh(
 
 
 # ---------------------------------------------------------------------------
+# Lights: proceduralParameters.lights -> UsdLux
+# ---------------------------------------------------------------------------
+
+# Unity light intensity is unitless / renderer-defined; USD's UsdLux intensity
+# is in nits (DistantLight) or candelas (SphereLight) when the renderer
+# interprets them physically. These multipliers are empirical — the 1000x for
+# directional matches the procthor converter's DEFAULT_DIR_LIGHT_INTENSITY
+# (molmo_spaces_isaac/.../assets/utils/lights.py), and 30000x for sphere lights
+# is tuned so a ceiling fixture at unity_intensity=0.75 reads as a typical room
+# light in IsaacSim. Tweak via the helpers if the result looks dim/blown out.
+_DIR_LIGHT_INTENSITY_MULT = 1000.0
+_POINT_LIGHT_INTENSITY_MULT = 300000.0
+# Synthetic ambient dome authored when `proceduralParameters.skyboxId` is set
+# (mansion ships the name but no texture). Matches procthor's authored
+# DomeLight intensity; run_isaac.py's tame_lights clamps this to --dome-max
+# (default 180) at render time -- same end result as procthor scenes.
+_DOME_LIGHT_INTENSITY = 1000.0
+
+
+def _light_rgb(item: dict[str, Any]) -> Gf.Vec3f:
+    rgb = item.get("rgb") or {"r": 1.0, "g": 1.0, "b": 1.0}
+    return Gf.Vec3f(float(rgb.get("r", 1.0)), float(rgb.get("g", 1.0)), float(rgb.get("b", 1.0)))
+
+
+def _author_directional_light(
+    stage: Usd.Stage,
+    parent_path: Sdf.Path,
+    idx: int,
+    light_dict: dict[str, Any],
+) -> None:
+    """Author a Unity directional light as ``UsdLux.DistantLight``.
+
+    Position is ignored (parallel rays — only direction matters). Unity Euler
+    angles use ZXY local-frame order; we mirror that with ``AddRotateZXYOp``.
+    USD distant lights emit along local **-Z** while Unity directionals emit
+    along local **+Z**, so we add a ``RotateY 180`` to flip the convention.
+    The light lives under ``/World`` so the y<->z reflection (M) applies
+    naturally to its world-space direction — same as scene geometry.
+    """
+    name = _safe_prim_name(f"directional_{idx}")
+    path = parent_path.AppendChild(name)
+    light = UsdLux.DistantLight.Define(stage, path)
+
+    intensity = float(light_dict.get("intensity", 1.0)) * _DIR_LIGHT_INTENSITY_MULT
+    light.CreateIntensityAttr().Set(intensity)
+    light.CreateColorAttr().Set(_light_rgb(light_dict))
+
+    rot = light_dict.get("rotation") or {}
+    rx = float(rot.get("x", 0.0))
+    ry = float(rot.get("y", 0.0))
+    rz = float(rot.get("z", 0.0))
+
+    xf = UsdGeom.Xformable(light)
+    # Unity ZXY order -> AddRotateZXYOp. (USD applies Rz, then Rx, then Ry to
+    # local axes after each prior rotation — matches Unity's eulerAngles.)
+    rot_op = xf.AddRotateZXYOp(UsdGeom.XformOp.PrecisionDouble)
+    rot_op.Set(Gf.Vec3d(rx, ry, rz))
+    # +Z (Unity forward) -> -Z (USD distant-light forward).
+    flip_op = xf.AddRotateYOp(UsdGeom.XformOp.PrecisionDouble)
+    flip_op.Set(180.0)
+
+
+def _author_point_light(
+    stage: Usd.Stage,
+    parent_path: Sdf.Path,
+    idx: int,
+    light_dict: dict[str, Any],
+) -> None:
+    """Author a Unity point light as ``UsdLux.SphereLight``.
+
+    Position is in Unity coords; ``/World``'s y<->z reflection handles the
+    swap to USD's z-up frame. Unity's ``range`` (hard distance cutoff) has no
+    direct USD equivalent — USD uses physical inverse-square falloff. We set a
+    small visible ``radius`` (purely cosmetic in the viewport).
+    """
+    raw_id = str(light_dict.get("id", f"point_{idx}"))
+    name = _safe_prim_name(f"point_{idx}__{raw_id}")
+    path = parent_path.AppendChild(name)
+    light = UsdLux.SphereLight.Define(stage, path)
+
+    pos = light_dict.get("position") or {"x": 0.0, "y": 0.0, "z": 0.0}
+    xf = UsdGeom.Xformable(light)
+    tx = xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
+    tx.Set(Gf.Vec3d(float(pos.get("x", 0.0)), float(pos.get("y", 0.0)), float(pos.get("z", 0.0))))
+
+    intensity = float(light_dict.get("intensity", 1.0)) * _POINT_LIGHT_INTENSITY_MULT
+    light.CreateIntensityAttr().Set(intensity)
+    light.CreateColorAttr().Set(_light_rgb(light_dict))
+    light.CreateRadiusAttr().Set(0.1)
+
+
+def _author_ambient_dome(
+    stage: Usd.Stage,
+    parent_path: Sdf.Path,
+    skybox_id: str,
+    skybox_textures_dir: Path | None,
+    out_root: Path,
+) -> str | None:
+    """Author a ``UsdLux.DomeLight`` for ambient + sky IBL.
+
+    If ``<skybox_textures_dir>/<skybox_id>.png`` exists, copy it into
+    ``<out_root>/Textures/`` and wire it onto the dome as a textured IBL --
+    matching the procthor convention (see ``~/.molmospaces/usd/scenes/
+    procthor-10k-val/<version>/val_*/Payload/Contents.usda``: ``DomeLight
+    "scene_skybox_light"`` with ``inputs:texture:file =
+    @./Textures/SkyAlbany.png@``). A textured dome provides directional
+    HDR sky illumination -- "daylight pours in through windows" -- which is
+    why procthor's renders look brighter than ours did with a neutral-white
+    dome at the same intensity.
+
+    Falls back to a neutral-white untextured dome if no matching PNG is found.
+    Returns the copied texture filename, or ``None`` if untextured.
+    """
+    path = parent_path.AppendChild("ambient_dome")
+    light = UsdLux.DomeLight.Define(stage, path)
+    light.CreateIntensityAttr().Set(_DOME_LIGHT_INTENSITY)
+
+    tex_src: Path | None = None
+    if skybox_textures_dir is not None:
+        cand = skybox_textures_dir / f"{skybox_id}.png"
+        if cand.is_file():
+            tex_src = cand
+        else:
+            LOG.warning(
+                "dome texture for skyboxId=%s not found in %s; "
+                "falling back to neutral-white dome",
+                skybox_id, skybox_textures_dir,
+            )
+
+    if tex_src is None:
+        light.CreateColorAttr().Set(Gf.Vec3f(1.0, 1.0, 1.0))
+        return None
+
+    out_textures = out_root / "Textures"
+    out_textures.mkdir(parents=True, exist_ok=True)
+    dst = out_textures / tex_src.name
+    if not dst.exists():
+        shutil.copy2(tex_src, dst)
+    light.CreateTextureFileAttr().Set(Sdf.AssetPath(f"./Textures/{tex_src.name}"))
+    light.CreateTextureFormatAttr().Set("automatic")
+    return tex_src.name
+
+
+def create_lights(
+    stage: Usd.Stage,
+    scene: dict[str, Any],
+    report: ConversionReport,
+    skybox_textures_dir: Path | None = None,
+    out_root: Path | None = None,
+) -> None:
+    """Author ``proceduralParameters.lights`` into ``/World/Lights``.
+
+    Reads Unity-style light dicts (directional / point) and emits
+    ``UsdLux.DistantLight`` / ``UsdLux.SphereLight`` respectively. Spot lights
+    are warned and skipped (no instances seen in audited mansion floors;
+    extend ``_author_spot_light`` when one appears).
+
+    Also authors a ``UsdLux.DomeLight`` when ``proceduralParameters.skyboxId``
+    is set; the dome is textured if a matching ``<skyboxId>.png`` is found
+    under ``skybox_textures_dir`` (see :func:`_author_ambient_dome`).
+    """
+    pp = scene.get("proceduralParameters") or {}
+    lights_in = pp.get("lights") or []
+    report.n_lights_total = len(lights_in)
+    skybox_id = pp.get("skyboxId")
+    if not lights_in and not skybox_id:
+        return
+
+    lights_root = UsdGeom.Xform.Define(stage, "/World/Lights")
+    parent_path = lights_root.GetPath()
+
+    for i, L in enumerate(lights_in):
+        typ = (L.get("type") or "").lower()
+        try:
+            if typ == "directional":
+                _author_directional_light(stage, parent_path, i, L)
+            elif typ == "point":
+                _author_point_light(stage, parent_path, i, L)
+            else:
+                LOG.warning("light %d: unsupported type %r, skipping", i, typ)
+                continue
+            report.n_lights_authored += 1
+        except Exception as exc:
+            LOG.warning("light %d (%s): failed to author (%s)", i, L.get("id", "?"), exc)
+
+    if skybox_id and out_root is not None:
+        tex = _author_ambient_dome(
+            stage, parent_path, skybox_id, skybox_textures_dir, out_root
+        )
+        report.has_ambient_dome = True
+        report.dome_texture = tex
+        LOG.info(
+            "ambient dome authored (skyboxId=%s, texture=%s)",
+            skybox_id, tex or "<neutral-white fallback>",
+        )
+
+    LOG.info(
+        "lights authored: %d/%d  ambient_dome=%s  dome_texture=%s",
+        report.n_lights_authored,
+        report.n_lights_total,
+        report.has_ambient_dome,
+        report.dome_texture or "-",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main conversion
 # ---------------------------------------------------------------------------
 
@@ -633,6 +839,11 @@ class ConversionReport:
     n_windows_placed: int = 0
     n_rooms: int = 0
     n_walls: int = 0
+    n_ceilings: int = 0
+    n_lights_total: int = 0
+    n_lights_authored: int = 0
+    has_ambient_dome: bool = False
+    dome_texture: str | None = None
     unique_assetids: int = 0
     baked_assets: int = 0
     referenced_assets: int = 0
@@ -646,6 +857,7 @@ def convert(
     objathor_dir: Path,
     thor_usd_dir: Path,
     objaverse_usd_dir: Path,
+    skybox_textures_dir: Path | None = None,
 ) -> Path:
     scene = json.loads(scene_json.read_text())
 
@@ -828,6 +1040,40 @@ def convert(
             LOG.warning("wall %s skipped: %s", wid, exc)
     LOG.info("walls authored: %d (%d with cutouts)", report.n_walls, walls_cut)
 
+    # ceilings: per-room floor polygons raised to the wall-top y so the
+    # rooms are enclosed. Mirrors procthor's per-room `ceiling_<roomid>_visual_0`
+    # convention. Set doubleSided so the underside is visible from inside.
+    ceil_y = max(
+        (float(p["y"]) for w in (scene.get("walls") or []) for p in (w.get("polygon") or [])),
+        default=0.0,
+    )
+    if ceil_y > 0.0:
+        ceilings_root = UsdGeom.Xform.Define(stage, "/World/Ceilings")
+        for room in scene.get("rooms") or []:
+            rid = _safe_prim_name(room.get("id", "room"))
+            poly = room.get("floorPolygon") or []
+            if len(poly) < 3:
+                continue
+            raised = [{"x": p["x"], "y": ceil_y, "z": p["z"]} for p in poly]
+            cid = _safe_prim_name(f"ceiling_{room.get('id', 'room')}")
+            try:
+                mesh = _add_polygon_mesh(
+                    stage, ceilings_root.GetPath().AppendChild(cid), raised,
+                    color=(0.95, 0.95, 0.95),
+                )
+                mesh.CreateDoubleSidedAttr(True)
+                report.n_ceilings += 1
+            except Exception as exc:
+                LOG.warning("ceiling %s skipped: %s", cid, exc)
+        LOG.info("ceilings authored: %d (y=%.3f)", report.n_ceilings, ceil_y)
+
+    # lights from proceduralParameters.lights
+    create_lights(
+        stage, scene, report,
+        skybox_textures_dir=skybox_textures_dir,
+        out_root=out_root,
+    )
+
     # objects + doors + windows
     inst_root = UsdGeom.Xform.Define(stage, "/World/Instances")
     instance_counts: dict[str, int] = {}
@@ -922,7 +1168,7 @@ def convert(
         json.dumps(report.__dict__, indent=2)
     )
     LOG.info(
-        "wrote %s  (rooms=%d walls=%d objects=%d/%d doors=%d/%d windows=%d/%d)",
+        "wrote %s  (rooms=%d walls=%d objects=%d/%d doors=%d/%d windows=%d/%d lights=%d/%d)",
         scene_usda,
         report.n_rooms,
         report.n_walls,
@@ -932,6 +1178,8 @@ def convert(
         report.n_doors_total,
         report.n_windows_placed,
         report.n_windows_total,
+        report.n_lights_authored,
+        report.n_lights_total,
     )
     return scene_usda
 
@@ -954,6 +1202,15 @@ def main() -> int:
         "--objaverse-usd-dir",
         type=Path,
         default=Path("/home/jkim3662/Projects/molmospaces/assets/usd/objects/objaverse"),
+    )
+    p.add_argument(
+        "--skybox-textures-dir",
+        type=Path,
+        default=Path.home() / ".molmospaces" / "usd" / "scenes" / "procthor-10k-val"
+        / "20260128" / "val_1_ceiling" / "Payload" / "Textures",
+        help="dir to search for `<skyboxId>.png` to use as DomeLight IBL "
+        "(matches procthor's textured-dome lighting). Falls back to neutral-white "
+        "dome if the file is missing.",
     )
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
@@ -979,6 +1236,7 @@ def main() -> int:
         objathor_dir=args.objathor_dir,
         thor_usd_dir=args.thor_usd_dir,
         objaverse_usd_dir=args.objaverse_usd_dir,
+        skybox_textures_dir=args.skybox_textures_dir,
     )
     return 0
 
