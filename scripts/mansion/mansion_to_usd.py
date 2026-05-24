@@ -627,7 +627,7 @@ def _add_polygon_mesh(
 # is tuned so a ceiling fixture at unity_intensity=0.75 reads as a typical room
 # light in IsaacSim. Tweak via the helpers if the result looks dim/blown out.
 _DIR_LIGHT_INTENSITY_MULT = 1000.0
-_POINT_LIGHT_INTENSITY_MULT = 300000.0
+_POINT_LIGHT_INTENSITY_MULT = 1000000.0 # 300000.0
 # Synthetic ambient dome authored when `proceduralParameters.skyboxId` is set
 # (mansion ships the name but no texture). Matches procthor's authored
 # DomeLight intensity; run_isaac.py's tame_lights clamps this to --dome-max

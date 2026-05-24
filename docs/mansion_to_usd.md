@@ -155,7 +155,7 @@ to 5 decimal places (max Δ = 0.00000 m).
 | Wall cutouts | ✅ | Hole world corners computed from segment endpoints + `holePolygon` y range, projected into each wall's frame so coincident interior walls cut at the same world position. |
 | Objathor anchor offset | ✅ | bbox-center subtracted (rotated by per-instance ry + yRotOffset) so meshes sit on the floor instead of floating by half-height. |
 | `yRotOffset` | ✅ | Read from objathor pkl and added to per-instance `rotation.y` (12 of 65 objathor assets in this scene have non-zero values). |
-| Lights | ✅ | `proceduralParameters.lights` → `UsdLux.DistantLight` (directional) + `UsdLux.SphereLight` (point), authored under `/World/Lights`. Intensity multipliers are `_DIR_LIGHT_INTENSITY_MULT = 1000`, `_POINT_LIGHT_INTENSITY_MULT = 300000` in `mansion_to_usd.py` — tweak there if scenes look dim/blown out. Unity directional emits along +Z while USD distant emits along -Z, so the converter adds a `RotateY 180` to flip. Spot lights are warned and skipped (no instances seen in audited floors). |
+| Lights | ✅ | `proceduralParameters.lights` → `UsdLux.DistantLight` (directional) + `UsdLux.SphereLight` (point), authored under `/World/Lights`. Intensity multipliers are `_DIR_LIGHT_INTENSITY_MULT = 1000`, `_POINT_LIGHT_INTENSITY_MULT = 1000000` in `mansion_to_usd.py` — tweak there if scenes look dim/blown out. Unity directional emits along +Z while USD distant emits along -Z, so the converter adds a `RotateY 180` to flip. Spot lights are warned and skipped (no instances seen in audited floors). |
 | Skybox / ambient dome | ✅ | When `proceduralParameters.skyboxId` is set, a `UsdLux.DomeLight` is authored under `/World/Lights/ambient_dome` at `_DOME_LIGHT_INTENSITY = 1000` (clamped to 180 by `run_isaac.py`'s `tame_lights`, matching procthor's render-time intensity). The Unity skybox name (`SkyAlbany`, `SkyAlbanyHill`, `SkyGasworks`, …) is the *same* string procthor uses for its dome textures, so the converter looks for `<skyboxId>.png` in `--skybox-textures-dir` (default: a procthor `val_*_ceiling/Payload/Textures/` dir), copies it into the scene's `Textures/`, and wires it as the dome's `inputs:texture:file` — giving the same HDR sky IBL procthor scenes ship with. Falls back to a neutral-white untextured dome if no matching PNG is found. |
 | Materials beyond albedo | ❌ | `normal.jpg`, `emission.jpg`, `metallic_smoothness.jpg` are unused |
 | Collisions / physics | ❌ | Visual mesh only; no `UsdPhysics.CollisionAPI` |
@@ -278,7 +278,7 @@ Step-by-step for a different building / floor:
   make scenes usable with PhysX/Newton.
 - **Lights are authored** (Unity `directional` → `UsdLux.DistantLight`, `point`
   → `UsdLux.SphereLight`), but the intensity multipliers (1000× for
-  directional, 300000× for point) are empirical — adjust the `_*_INTENSITY_MULT`
+  directional, 1000000× for point) are empirical — adjust the `_*_INTENSITY_MULT`
   constants at the top of the "Lights" section in
   `scripts/mansion/mansion_to_usd.py` if scenes render dim or blown out.
   Spot lights are skipped (no instances seen in audited floors); add a
