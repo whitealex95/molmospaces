@@ -119,13 +119,15 @@ python scripts/mansion/mansion_to_usd.py \
 Outputs:
 
 ```
-~/Projects/mansion/usd_export/<scene_stem>/
-├── scene.usda            # the file to drag into IsaacSim
+~/Projects/mansion/usd_export/<building>/<scene_stem>/
+├── scene.usda                # the file to drag into IsaacSim
 ├── assets/
-│   ├── <uid>.usda        # one per unique objathor mesh referenced by this scene
-│   ├── <uid>/albedo.jpg  # texture copies (so scene is self-contained)
+│   ├── <uid>.usda            # one per unique objathor mesh referenced by this scene
+│   ├── <uid>/albedo.jpg      # texture copies (so scene is self-contained)
 │   └── ...
-└── conversion_report.json   # what got rendered, what got skipped, why
+├── Textures/
+│   └── <skyboxId>.png        # skybox PNG copied from --skybox-textures-dir (e.g. SkyAlbany.png)
+└── conversion_report.json    # what got rendered, what got skipped, why
 ```
 
 Open `scene.usda` in IsaacSim (`File → Open`, or drag into Stage).
@@ -154,7 +156,7 @@ to 5 decimal places (max Δ = 0.00000 m).
 | Objathor anchor offset | ✅ | bbox-center subtracted (rotated by per-instance ry + yRotOffset) so meshes sit on the floor instead of floating by half-height. |
 | `yRotOffset` | ✅ | Read from objathor pkl and added to per-instance `rotation.y` (12 of 65 objathor assets in this scene have non-zero values). |
 | Lights | ✅ | `proceduralParameters.lights` → `UsdLux.DistantLight` (directional) + `UsdLux.SphereLight` (point), authored under `/World/Lights`. Intensity multipliers are `_DIR_LIGHT_INTENSITY_MULT = 1000`, `_POINT_LIGHT_INTENSITY_MULT = 300000` in `mansion_to_usd.py` — tweak there if scenes look dim/blown out. Unity directional emits along +Z while USD distant emits along -Z, so the converter adds a `RotateY 180` to flip. Spot lights are warned and skipped (no instances seen in audited floors). |
-| Skybox / ambient dome | 🟡 partial | When `proceduralParameters.skyboxId` is set, a synthetic neutral-white `UsdLux.DomeLight` is authored under `/World/Lights/ambient_dome` at `_DOME_LIGHT_INTENSITY = 1000` (clamped to 180 by `run_isaac.py`'s `tame_lights`, matching procthor's render-time intensity). The Unity skybox name (e.g. `SkyAlbany`) is *not yet* used as a texture — procthor's `Payload/Contents.usda` references `Textures/SkyAlbany.png` on its dome to get HDR-style IBL through windows; mansion's dome is currently uniform fill only. See §6 for the texture-IBL TODO. |
+| Skybox / ambient dome | ✅ | When `proceduralParameters.skyboxId` is set, a `UsdLux.DomeLight` is authored under `/World/Lights/ambient_dome` at `_DOME_LIGHT_INTENSITY = 1000` (clamped to 180 by `run_isaac.py`'s `tame_lights`, matching procthor's render-time intensity). The Unity skybox name (`SkyAlbany`, `SkyAlbanyHill`, `SkyGasworks`, …) is the *same* string procthor uses for its dome textures, so the converter looks for `<skyboxId>.png` in `--skybox-textures-dir` (default: a procthor `val_*_ceiling/Payload/Textures/` dir), copies it into the scene's `Textures/`, and wires it as the dome's `inputs:texture:file` — giving the same HDR sky IBL procthor scenes ship with. Falls back to a neutral-white untextured dome if no matching PNG is found. |
 | Materials beyond albedo | ❌ | `normal.jpg`, `emission.jpg`, `metallic_smoothness.jpg` are unused |
 | Collisions / physics | ❌ | Visual mesh only; no `UsdPhysics.CollisionAPI` |
 
@@ -171,6 +173,7 @@ Running the Section 3 command on
 ~/Projects/mansion/usd_export/public_healthcare_3f_300_fp001_0/floor_1/
 ├── scene.usda                  ~92 KB (1829 prims total)
 ├── assets/                     ~85 MB, 67 baked .usda + 67 texture subdirs
+├── Textures/                   ~5 MB, one PNG (SkyAlbany.png, copied from --skybox-textures-dir)
 └── conversion_report.json
 ```
 
@@ -179,7 +182,8 @@ Summary line printed at the end:
 ```
 wrote .../scene.usda  (rooms=7 walls=82 objects=144/144 doors=7/7 windows=13/13 lights=8/8)
 INFO mansion_to_usd: ceilings authored: 7 (y=3.200)
-INFO mansion_to_usd: lights authored: 8/8
+INFO mansion_to_usd: ambient dome authored (skyboxId=SkyAlbany, texture=SkyAlbany.png)
+INFO mansion_to_usd: lights authored: 8/8  ambient_dome=True  dome_texture=SkyAlbany.png
 ```
 
 `conversion_report.json`:
@@ -191,6 +195,7 @@ INFO mansion_to_usd: lights authored: 8/8
   "n_windows_total": 13,  "n_windows_placed": 13,
   "n_rooms": 7, "n_walls": 82, "n_ceilings": 7,
   "n_lights_total": 8, "n_lights_authored": 8,
+  "has_ambient_dome": true, "dome_texture": "SkyAlbany.png",
   "unique_assetids": 85, "baked_assets": 67, "referenced_assets": 18,
   "missing_assetids": [], "skipped_objects": []
 }
@@ -247,11 +252,11 @@ Step-by-step for a different building / floor:
        --output-dir ~/Projects/mansion/usd_export
    ```
 
-5. **Inspect**:
+5. **Inspect** (note: `#` in the building name is rewritten to `_` for the output dir):
    ```bash
-   ls ~/Projects/mansion/usd_export/<building>__floor_<n>/
-   # scene.usda  assets/  conversion_report.json
-   cat ~/Projects/mansion/usd_export/<building>__floor_<n>/conversion_report.json
+   ls ~/Projects/mansion/usd_export/<building>/floor_<n>/
+   # scene.usda  assets/  Textures/  conversion_report.json
+   cat ~/Projects/mansion/usd_export/<building>/floor_<n>/conversion_report.json
    ```
 
 6. **Open in IsaacSim**: drag `scene.usda` into the Stage panel.
@@ -260,10 +265,10 @@ Step-by-step for a different building / floor:
 
 ## 6. Known issues / TODO
 
-- **Doors and windows don't punch holes in walls.** They're placed as floating
-  geometry inside the wall plane, so doorways will visually overlap the wall.
-  Fix would replicate molmospaces's `make_hole_in_wall` logic
-  (`molmo_spaces/housegen/utils.py`) for USD walls.
+- **Door/window meshes float in the wall plane** (the wall itself *is* cut at
+  the hole — see the §4 "Wall cutouts" row, 40/82 walls cut on `floor_1` — so
+  the doorway is open, but the door/window mesh sits flush with the wall plane
+  rather than recessed into a frame). Cosmetic; doesn't block traversal.
 - **Materials are albedo-only.** Objathor packages ship `albedo.jpg`,
   `normal.jpg`, `emission.jpg` (and `metallic_smoothness.jpg` for patched
   assets). v1 only wires albedo into `UsdPreviewSurface.diffuseColor`. The
@@ -278,15 +283,6 @@ Step-by-step for a different building / floor:
   `scripts/mansion/mansion_to_usd.py` if scenes render dim or blown out.
   Spot lights are skipped (no instances seen in audited floors); add a
   `_author_spot_light` helper when one appears.
-- **DomeLight is authored but not yet textured.** When `proceduralParameters.skyboxId`
-  is set the converter writes a neutral-white `UsdLux.DomeLight` to fill ambient
-  shadow regions. The skyboxId names (`SkyAlbany`, `SkyAlbanyHill`, `SkyGasworks`,
-  …) are the *same* names procthor uses for its dome textures — see
-  `~/.molmospaces/usd/scenes/procthor-10k-val/20260128/<scene>_ceiling/Payload/Textures/SkyAlbany.png`.
-  Wiring those PNGs into the mansion dome would give true IBL (sky pouring in
-  through windows) and bridge the remaining brightness gap with procthor.
-  TODO: copy / symlink the matching texture into `usd_export/<scene>/Textures/`
-  and set `inputs:texture:file = @./Textures/<skyboxId>.png@` on the dome.
 - **Walls and floors share z=0**, which causes z-fighting along the wall
   bases. Either thicken walls into boxes (preferred) or offset the floor
   slightly.
@@ -326,16 +322,19 @@ identical to the MJCF output.
 
 The conversion produces a syntactically valid USDA (`pxr.Usd.Stage.Open`
 succeeds, references resolve) and the geometry is numerically verified: every
-room floor vertex lands at `M(unity_json_vertex)` (7/7 rooms). It has not been
-opened in IsaacSim to confirm the rendered result. If something looks off:
+room floor vertex lands at `M(unity_json_vertex)` (7/7 rooms). Scenes have
+been opened in IsaacSim via `scripts/navigation/run_isaac.py` (see
+`docs/navigation_pipeline.md`) — rendered output confirms geometry, materials,
+and lighting all behave. If something looks off:
 
-1. ~~Concave floor polygons render as overlapping triangles~~ — **fixed**:
-   `_add_polygon_mesh` ear-clips the polygon (`_triangulate_polygon`).
-2. ~~Z-up / handedness wrong~~ — **fixed**: `/World` applies the reflection
-   `M` (see "Coordinate convention" and `docs/mansion_to_mjcf.md` §M). If
-   faces render inside-out, that is a winding/normals interaction with the
-   reflecting root transform — set the mesh `orientation` or flip normals.
-3. Object instances upside-down / flipped → check `yRotOffset` handling.
+1. Object instances upside-down / flipped → check `yRotOffset` handling
+   (§4 table, "yRotOffset" row + `docs/mansion_to_mjcf.md` §H).
+2. Faces render inside-out → winding/normals interaction with the reflecting
+   root transform `M`; set the mesh `orientation` or flip normals.
+3. Scene too dark → check `_POINT_LIGHT_INTENSITY_MULT` /
+   `_DOME_LIGHT_INTENSITY` in `scripts/mansion/mansion_to_usd.py`, and that
+   `--skybox-textures-dir` points somewhere with `<skyboxId>.png`
+   (`conversion_report.json` `dome_texture` should not be `null`).
 
 ---
 
