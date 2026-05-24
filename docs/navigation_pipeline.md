@@ -49,6 +49,15 @@ the IsaacSim runtime.
   - procthor — the molmospaces USD asset store at `~/.molmospaces/usd/scenes/`:
     `~/.molmospaces/usd/scenes/<procthor-10k-val|procthor-objaverse-val>/<version>/<scene>/scene.usda`
     (current version `20260128`).
+- **Ceilinged variants** — both runtimes default to enclosed rooms (ceiling
+  visible overhead). Pass the *_ceiling* variant of each scene:
+  - **procthor** ships them per scene as `val_<N>_ceiling.xml` (MJCF) and
+    `val_<N>_ceiling/scene.usda` (USD), with `ceiling_<roomid>_visual_0` meshes
+    at the room's wall-top z. They share the room ids, doorways, and world
+    frame of `val_<N>`, so the same `occupancy.npz` / `path.npz` drive both.
+  - **mansion** has the ceiling baked into `scene.xml` / `scene.usda` since
+    both converters emit `ceiling_<roomid>` per room — raise each `floorPolygon`
+    to the global wall-top `y`. The USD ceilings are `doubleSided`.
 - **Robot**: Unitree G1 — MJCF
   `~/Projects/CAMDM/PyTorch/visualize/assets/g1_29dof_rev_1_0.xml` (run_mujoco);
   USD `~/Projects/CAMDM/PyTorch/visualize/assets/g1_isaac/configuration/g1_base.usd`
@@ -143,10 +152,39 @@ Scene + `path.npz` → the egocentric/chase video.
 
 1. **Merge the G1** — load scene and G1 as `MjSpec`s, absolutise the G1 mesh
    paths, then `scene.worldbody.add_frame().attach_body(g1_root, "g1_", "")`.
-   Add an `ego` camera on `g1_torso_link` (pos `[0.12,0,0.42]`, quat
-   `[0.5,0.5,-0.5,-0.5]` → looks +x forward, +z world-up). For the Filament
-   backend also mount a forward fill light on the torso — Filament ignores the
-   MuJoCo headlight, so an interior ego view would otherwise be near-black.
+   Add an `ego` camera on `g1_torso_link` at the **Realsense D435 mount
+   position** taken from the G1 URDF (`d435_link` fixed joint off
+   `torso_link`), but with the URDF's downward pitch **removed** so the
+   camera looks forward — the real D435 tilts down 47.6° for manipulation,
+   but a forward-facing view is far more useful for navigation (the agent
+   sees what's ahead instead of staring at its own arms and the floor).
+
+   URDF reference:
+
+   ```xml
+   <!-- d435 -->
+   <link name="d435_link"></link>
+   <joint name="d435_joint" type="fixed">
+     <origin xyz="0.0576235 0.01753 0.42987" rpy="0 0.8307767239493009 0"/>
+     <parent link="torso_link"/>
+     <child link="d435_link"/>
+   </joint>
+   ```
+
+   We keep `xyz = [0.0576235, 0.01753, 0.42987]` (relative to `torso_link`)
+   and drop the rpy. MuJoCo: `cam.pos = [0.0576235, 0.01753, 0.42987]`,
+   `cam.quat = [0.5, 0.5, -0.5, -0.5]` (looks +x forward, +z world-up).
+   Isaac: `EGO_LOCAL = Gf.Matrix4d(0, -1, 0, 0, 0, 0, 1, 0, -1, 0, 0, 0,
+   0.0576235, 0.01753, 0.42987, 1)` — same translation, identical horizontal
+   orientation. The MuJoCo G1 MJCF (`g1_29dof_rev_1_0.xml`) and the Isaac G1
+   USD both strip `d435_link` (the URDF→MJCF/USD conversion loses fixed-only
+   links; the MJCF still declares `head_link.STL` as an unused mesh asset),
+   so the camera mounts directly on `torso_link` with this offset baked in.
+
+   For the Filament backend also mount a forward fill light on the torso at
+   the same position, pointed slightly down (`lamp.dir = [1.0, 0, -0.15]`) —
+   Filament ignores the MuJoCo headlight, so an interior ego view would
+   otherwise be near-black.
 2. **Path → motion** — `resample_path` densifies the polyline to
    `SPEED/STEP_HZ` spacing (SPEED 1.0 m/s, STEP_HZ 30); `smooth_path` is a
    moving average (`SMOOTH_WINDOW` 45); `compute_yaws` takes the
@@ -154,8 +192,11 @@ Scene + `path.npz` → the egocentric/chase video.
    0.2). Together these give smooth, non-snapping camera turns.
 3. **Kinematic step loop** — per step set the G1 floating-base qpos to
    `[x, y, PELVIS_Z=0.793, *yaw_quat(yaw)]`, `mj_forward`, then render the
-   ego RGB, ego depth, and a chase view (`mjCAMERA_TRACKING` on `g1_pelvis`).
-   No physics — the base is placed directly.
+   ego RGB, ego depth, and a chase view. The chase is a free
+   (`mjCAMERA_FREE`) camera repositioned each frame so it sits close behind
+   the robot and below the ceiling (`CHASE_BACK` 1.3 m, `CHASE_Z` 2.3 m,
+   `CHASE_LOOK_Z` 0.9 m); this stays inside the ceilinged room and matches
+   run_isaac. No physics — the base is placed directly.
 4. **Renderer** — `--renderer opengl` uses `mujoco.Renderer` (run in
    `mlspaces-mujoco`); `--renderer filament` uses the molmospaces
    `MjFilamentRenderer` (run in `mlspaces`, physically based lighting).
@@ -189,11 +230,13 @@ diagnostic history.
 4. **Cameras — identical placement to run_mujoco.** The ego `Camera` sensor is
    a child of `/g1/pelvis/torso_link` with a fixed local transform (0.12 m
    forward + 0.42 m up, looking along the robot's +x), so it rides the robot
-   like run_mujoco's torso-mounted camera. The chase `Camera` tracks the pelvis
-   from a fixed world offset equal to run_mujoco's tracking camera (azimuth 130
-   / elevation -55 / distance 6 — the offset is measured straight off the
-   MuJoCo camera). Both cameras use a 45° vertical FOV (MuJoCo's default camera
-   fovy). The G1 base sits at `G1_GROUND_Z` so its soles rest on the z=0 floor.
+   like run_mujoco's torso-mounted camera. The chase `Camera` is repositioned
+   each frame via `set_camera_view` to sit behind the robot and below the
+   ceiling (`CHASE_BACK` 1.3 m, `CHASE_Z` 2.3 m, `CHASE_LOOK_Z` 0.9 m), which
+   matches run_mujoco's interior chase exactly. Both cameras use a 45°
+   vertical FOV (MuJoCo's default camera fovy). The G1 base sits at
+   `G1_GROUND_Z` = 0.315 m so its soles rest on the z=0 floor (mansion and
+   procthor both place the floor at z=0).
 5. **Drive + capture** — per smoothed pose, place `/g1` (translate + Z-rotate),
    aim `/chase_cam` via `set_camera_view`, `world.step(render=True)`, then read
    `get_rgba()` and the `distance_to_image_plane` depth from each sensor.
@@ -287,6 +330,8 @@ trajectory, beside the MuJoCo files) and the `<scene>/` dir itself for procthor
 | `SPEED`, `STEP_HZ` | run_mujoco | 1.0, 30 | travel speed, render rate |
 | `SMOOTH_WINDOW` | run_mujoco | 45 | path moving-average window |
 | `YAW_ALPHA` | run_mujoco | 0.2 | heading low-pass (smaller = smoother) |
+| `CHASE_BACK / CHASE_Z / CHASE_LOOK_Z` | run_mujoco, run_isaac | 1.3, 2.3, 0.9 | interior chase camera offset (must stay below the ceiling) |
+| `G1_GROUND_Z` | run_isaac | 0.315 | G1 base height so soles rest on z=0 |
 | `MIN_LENGTH_M` | gen_trajectories | 2.0 | reject degenerate samples |
 
 ## Gotchas
@@ -306,6 +351,15 @@ trajectory, beside the MuJoCo files) and the `<scene>/` dir itself for procthor
   `get_thormap`, so the Filament THORMAP segfault (issue #79) does not apply.
 - **Single navigable room** — the driver falls back to within-room sampling
   rather than erroring; such trajectories are flagged `cross_room: false`.
+- **Ceilings vs occupancy** — `build_occupancy.py` ignores geoms outside the
+  floor / wall / door categories, so a `ceiling_*` mesh does not become an
+  obstacle; one occupancy grid serves both ceilinged and uncovered variants of
+  a scene. The chase camera height (`CHASE_Z` 2.3 m) is the only constant tied
+  to ceiling height — raise it if a scene's ceiling sits above 2.9 m.
+- **procthor-objaverse lazy install** — `val_<N>_ceiling.xml` is a symlink and
+  may be missing under `scenes/procthor-objaverse-val/` after a cache prune.
+  Call `install_scene_with_objects_and_grasps_from_path(val_<N>.xml)` to
+  re-create it (the helper also pulls the scene's objaverse + grasp assets).
 
 ## Running it
 
@@ -314,6 +368,23 @@ Batch (one scene), from a conda-equipped shell:
 python scripts/navigation/gen_trajectories.py \
     --scene <scene.xml> --dataset <label> --count <N> [--renderer opengl|filament]
 ```
+
+Interactive viewer (needs `DISPLAY=:20` under Chrome Remote Desktop):
+```bash
+# MuJoCo viewer, optionally with the G1 merged in
+conda activate mlspaces-mujoco
+DISPLAY=:20 XAUTHORITY=$HOME/.Xauthority \
+  python scripts/navigation/open_mujoco_gui.py <scene.xml> [--g1 [X Y]]
+
+# IsaacSim viewer, optionally referencing the G1 USD
+conda activate mlspaces-isaac
+DISPLAY=:20 XAUTHORITY=$HOME/.Xauthority \
+  python scripts/navigation/open_isaac_gui.py <scene.usda> [--g1 [X Y]]
+```
+`--g1` (no args) spawns the robot at the scene origin; pass `X Y` to place it
+at an arbitrary xy. The MuJoCo viewer can switch to the `ego` camera (drop-down
+in the side panel) to preview what `run_mujoco.py` records; the IsaacSim
+viewport defaults to a free-fly camera you can drive around the scene.
 
 Manual, stage by stage, in `mlspaces-mujoco`:
 ```bash
