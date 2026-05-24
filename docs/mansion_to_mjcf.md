@@ -121,7 +121,7 @@ $ cat .../floor_1/conversion_report.json
   "n_objects_total": 144, "n_objects_placed": 144,
   "n_doors_total": 7,     "n_doors_placed": 7,
   "n_windows_total": 13,  "n_windows_placed": 13,
-  "n_rooms": 7, "n_walls": 82,
+  "n_rooms": 7, "n_walls": 82, "n_ceilings": 7,
   "unique_assetids": 85,
   "baked_objathor": 67, "baked_thor_mjcf": 18,
   "missing_assetids": [], "skipped_objects": []
@@ -150,6 +150,7 @@ populated with their objathor furniture).
 | Feature | v1 status | Notes |
 |---|---|---|
 | Floor per room | ✅ | Fan-triangulated polygon mesh, `inertia="shell"` |
+| Ceiling per room | ✅ | Each room's `floorPolygon` re-emitted at `y = max(wall.polygon.y)` as `ceilings/<roomid>.obj` and `ceiling_<roomid>` geom; same triangulation + `inertia="shell"` as the floor |
 | Walls | ✅ | Fan-triangulated polygon mesh, `inertia="shell"` |
 | Objects (objathor `.pkl.gz` / patched `.json`) | ✅ | `<id>.obj` with v/vt/vn/f + PNG albedo. Anchor offset applied to land bbox on the floor (objathor mesh origin is bbox-bottom-center while mansion `position.y` is bbox-center). |
 | Objects (THOR-MJCF) | ✅ | Mesh files copied as-is, prefixed names, visual geoms only |

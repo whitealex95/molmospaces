@@ -964,6 +964,7 @@ class ConversionReport:
     n_windows_placed: int = 0
     n_rooms: int = 0
     n_walls: int = 0
+    n_ceilings: int = 0
     unique_assetids: int = 0
     baked_objathor: int = 0
     baked_thor_mjcf: int = 0
@@ -983,7 +984,8 @@ def convert(
     out_assets = out_root / "assets"
     out_rooms = out_assets / "rooms"
     out_walls = out_assets / "walls"
-    for d in (out_assets, out_rooms, out_walls):
+    out_ceilings = out_assets / "ceilings"
+    for d in (out_assets, out_rooms, out_walls, out_ceilings):
         d.mkdir(parents=True, exist_ok=True)
     LOG.info("output directory: %s", out_root)
 
@@ -1147,6 +1149,28 @@ def convert(
             LOG.warning("wall %s skipped: %s", wid, exc)
     LOG.info("walls written: %d (%d with cutouts)", len(wall_meshes), walls_cut)
 
+    # ceilings: per-room floor polygons raised to wall-top y so each room is
+    # enclosed. Mirrors procthor's `ceiling_<roomid>` convention. Walls all
+    # share the same top height on a given floor; use the global max as ceil_y.
+    ceiling_meshes: list[tuple[str, str]] = []
+    ceil_y = max(
+        (float(p["y"]) for w in (scene.get("walls") or []) for p in (w.get("polygon") or [])),
+        default=0.0,
+    )
+    if ceil_y > 0.0:
+        for room in scene.get("rooms") or []:
+            rid = _safe_mjcf_name(room.get("id", "room"))
+            poly = room.get("floorPolygon") or []
+            if len(poly) < 3:
+                continue
+            raised = [{"x": p["x"], "y": ceil_y, "z": p["z"]} for p in poly]
+            try:
+                write_polygon_obj(out_ceilings / f"{rid}.obj", raised)
+                ceiling_meshes.append((f"ceiling_{rid}", f"ceilings/{rid}.obj"))
+            except Exception as exc:
+                LOG.warning("ceiling %s skipped: %s", rid, exc)
+    LOG.info("ceilings written: %d (y=%.3f)", len(ceiling_meshes), ceil_y)
+
     # ------------------------------------------------------------------- pass 4
     # build scene.xml
     scene_xml = out_root / "scene.xml"
@@ -1218,6 +1242,10 @@ def convert(
         lines.append(f'    <mesh name="{_xml_escape(name)}" '
                      f'file="{_xml_escape(relfile)}" '
                      f'scale="{MESH_SCALE}" inertia="shell"/>')
+    for name, relfile in ceiling_meshes:
+        lines.append(f'    <mesh name="{_xml_escape(name)}" '
+                     f'file="{_xml_escape(relfile)}" '
+                     f'scale="{MESH_SCALE}" inertia="shell"/>')
     lines.append('  </asset>')
 
     # --- worldbody
@@ -1246,6 +1274,15 @@ def convert(
                      f'mesh="{_xml_escape(name)}" rgba="0.92 0.92 0.92 1" '
                      f'contype="0" conaffinity="0"/>')
         report.n_walls += 1
+    lines.append('      </body>')
+
+    # ceilings
+    lines.append('      <body name="ceilings" euler="90 0 0">')
+    for name, _ in ceiling_meshes:
+        lines.append(f'        <geom name="{_xml_escape(name)}" type="mesh" '
+                     f'mesh="{_xml_escape(name)}" rgba="0.95 0.95 0.95 1" '
+                     f'contype="0" conaffinity="0"/>')
+        report.n_ceilings += 1
     lines.append('      </body>')
 
     # instances
@@ -1349,10 +1386,11 @@ def convert(
         json.dumps(report.__dict__, indent=2)
     )
     LOG.info(
-        "wrote %s  (rooms=%d walls=%d objects=%d/%d doors=%d/%d windows=%d/%d)",
+        "wrote %s  (rooms=%d walls=%d ceilings=%d objects=%d/%d doors=%d/%d windows=%d/%d)",
         scene_xml,
         report.n_rooms,
         report.n_walls,
+        report.n_ceilings,
         report.n_objects_placed,
         report.n_objects_total,
         report.n_doors_placed,
