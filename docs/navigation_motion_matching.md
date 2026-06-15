@@ -96,21 +96,31 @@ exactly. The top-down panel therefore draws **both** the planned path (orange
 polyline) and the robot's *actual* position (red dot), so the gap is visible
 rather than hidden.
 
-### Control overlay on the top-down panel
+### Control overlay — drawn in-scene, in the overhead chase
 
-So the motion-matching command is legible at a glance, the top-down map panel
-(labelled `Map: target + MM command`) overlays the full control state each
-frame:
+The target path and the motion-matching command are drawn as **real 3D geometry
+inside the MuJoCo scene** (appended to the renderer's `MjvScene` via
+`mjv_initGeom` / `mjv_connector` each frame), so they appear in the rendered
+**overhead chase** view (top-right panel, labelled `Chase: target + MM command`)
+— not as a flat overlay on the 2D map. The geoms are injected **only for the
+chase camera**, so the ego RGB + depth streams stay clean (no markers polluting
+the depth). Both renderer backends draw them: the OpenGL `mujoco.Renderer` and
+the Filament renderer both rasterize the `MjvScene` via `mjr_render`.
 
-- **orange polyline** — the (rounded) planned path, baked into the static panel.
-- **red dot + grey stub** — the robot's actual pelvis position and heading.
-- **green ring** — the pure-pursuit **lookahead target** on the planned path.
-- **cyan arrow** — the **command input** `desiredVel` handed to `matcher.step`
-  (the direction the controller is being told to go, ~0.8 m long).
-- **magenta dots + line** — the matcher's own **predicted command trajectory**
+- **orange floor strip** — the (rounded) planned path, a capsule chain on the
+  floor (`PATH_Z` 0.04 m, subsampled to ~0.2 m segments).
+- **green sphere** — the pure-pursuit **lookahead target** on the planned path.
+- **yellow arrow** — the **command input** `desiredVel` handed to `matcher.step`
+  (the direction the controller is told to go, ~0.8 m long).
+- **magenta spheres + line** — the matcher's own **predicted command trajectory**
   (`matcher.Tpos`, its critically-damped spring prediction at the `HORIZONS`
   taps), mapped from the matcher frame into the scene. This is what the search
   query is built against, so it shows where the controller "thinks" it is headed.
+
+The 2D **top-down map** panel (top-left) keeps just the baked planned path plus
+the robot's actual pelvis position + heading marker. Colours of the in-scene
+geoms are set in `run_mujoco_mm.py` (`PATH_RGBA` / `TARGET_RGBA` / `CMD_RGBA` /
+`TPOS_RGBA`, RGBA 0–1); heights via `PATH_Z` / `TPOS_Z` / `TARGET_Z` / `CMD_Z`.
 
 **Arrival / termination** — when the robot is within `ARRIVE_TOL_M` (0.4 m) of
 the final waypoint, `desiredVel` goes to zero and the gait settles for

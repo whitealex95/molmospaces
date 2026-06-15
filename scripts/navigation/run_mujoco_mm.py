@@ -21,8 +21,12 @@ teleported onto an arbitrary path. So we:
 2. Steer with **pure pursuit**: each frame aim a desired velocity at a lookahead
    point along the densified path (expressed in the matcher frame via ``T^-1``).
    The matcher drifts slightly off the line -- that is expected and realistic for
-   motion matching -- so the top-down panel draws BOTH the planned path and the
-   robot's actual position.
+   motion matching.
+
+The target path and the motion-matching command (lookahead target, desiredVel
+arrow, the matcher's predicted Tpos trajectory) are drawn as real 3D geometry in
+the scene -- appended to the renderer's MjvScene for the CHASE camera only, so
+they show in the overhead chase view while the ego RGB/depth stay clean.
 
 The Menagerie G1 (``assets/unitree_g1/g1.xml`` in the motion-matching repo) is the
 exact model the matcher's 36-D qpos is authored for (root 7 + 29 joints, same
@@ -31,8 +35,9 @@ body names that ``run_mujoco.py`` already mounts the ego camera on, so the camer
 rig is unchanged.
 
 Output (in --out-dir, default nav_runs_mm/...):
-  combined.mp4   -- 2x2: top-down map | overhead chase | ego RGB | ego depth
+  combined.mp4   -- 2x2: top-down map | chase (target + MM command) | ego RGB | ego depth
   ego_rgb.mp4 / ego_depth.mp4 / follow.mp4  -- the individual streams
+  motion_full.npz / motion_min.npz          -- full vs minimal saved motion
 
 Renderer (--renderer):
   opengl    -- stock MuJoCo OpenGL; run from the ``mlspaces-mujoco`` env.
@@ -117,6 +122,49 @@ def resample_path(waypoints: np.ndarray, step: float) -> np.ndarray:
     return np.array(out)
 
 
+# --- In-scene debug geometry -------------------------------------------------
+# Appended to the renderer's MjvScene each frame so the target path + the
+# motion-matching command show up as real 3D geometry in the render (the
+# overhead chase view), not as a flat 2D overlay on the map panel. RGBA is
+# 0..1 (NOT the BGR the cv2 map overlay used).
+PATH_RGBA = (1.0, 0.55, 0.0, 1.0)  # planned path, orange floor strip
+TARGET_RGBA = (0.1, 0.9, 0.2, 1.0)  # pure-pursuit lookahead target, green
+CMD_RGBA = (1.0, 0.85, 0.0, 1.0)  # desiredVel command arrow, yellow
+TPOS_RGBA = (0.85, 0.2, 0.8, 1.0)  # matcher predicted command trajectory, magenta
+PATH_Z = 0.04  # heights (m) above the z=0 floor for each marker
+TPOS_Z = 0.08
+TARGET_Z = 0.12
+CMD_Z = 0.12
+
+
+def _decor_sphere(scene, pos, radius, rgba):
+    if scene.ngeom >= scene.maxgeom:
+        return
+    g = scene.geoms[scene.ngeom]
+    mujoco.mjv_initGeom(
+        g,
+        mujoco.mjtGeom.mjGEOM_SPHERE,
+        np.array([radius, 0.0, 0.0]),
+        np.asarray(pos, float),
+        np.eye(3).ravel(),
+        np.asarray(rgba, np.float32),
+    )
+    g.category = int(mujoco.mjtCatBit.mjCAT_DECOR)
+    scene.ngeom += 1
+
+
+def _decor_connector(scene, gtype, width, frm, to, rgba):
+    if scene.ngeom >= scene.maxgeom:
+        return
+    g = scene.geoms[scene.ngeom]
+    mujoco.mjv_initGeom(
+        g, gtype, np.zeros(3), np.zeros(3), np.eye(3).ravel(), np.asarray(rgba, np.float32)
+    )
+    mujoco.mjv_connector(g, gtype, width, np.asarray(frm, float), np.asarray(to, float))
+    g.category = int(mujoco.mjtCatBit.mjCAT_DECOR)
+    scene.ngeom += 1
+
+
 def build_model(scene_xml: Path, g1_xml: Path, backend: str = "opengl"):
     """Merge the Menagerie G1 into the scene MJCF; add a head-mounted 'ego'
     camera (identical placement to run_mujoco.py). For Filament also mount a
@@ -173,7 +221,7 @@ def make_renderer(model, height: int, width: int, backend: str):
         r = mujoco.Renderer(model, height, width)
         update = r.update_scene
 
-    def render(data, camera, depth: bool = False) -> np.ndarray:
+    def render(data, camera, depth: bool = False, decorate=None) -> np.ndarray:
         if depth:
             r.enable_depth_rendering()
             update(data, camera)
@@ -182,6 +230,8 @@ def make_renderer(model, height: int, width: int, backend: str):
             return out
         r.disable_depth_rendering()
         update(data, camera)
+        if decorate is not None:  # append in-scene debug geoms after the scene
+            decorate(r.scene)  # is built, before it is rasterized
         return np.array(r.render())
 
     return render
@@ -414,6 +464,11 @@ def main() -> int:
     # Densified planned path for pure pursuit + the top-down reference line.
     planned = resample_path(waypoints, PATH_STEP_M)
     path_len = float(np.sum(np.linalg.norm(np.diff(planned, axis=0), axis=1)))
+    # Subsampled (~0.2 m) copy used to draw the path as a 3D floor strip in-scene.
+    stride = max(1, int(round(0.2 / PATH_STEP_M)))
+    path3d = planned[::stride]
+    if not np.array_equal(path3d[-1], planned[-1]):
+        path3d = np.vstack([path3d, planned[-1]])
 
     matcher = load_matcher(args.mm_root)
     # Motion-library index tables for the compact ("minimal") representation:
@@ -516,47 +571,69 @@ def main() -> int:
         x, y = float(qscene[0]), float(qscene[1])
         yaw = matcher.rootYaw + dtheta
 
-        rgb = render(data, "ego")[:, :, ::-1].copy()
+        # Predicted command trajectory (matcher.Tpos), matcher frame -> scene xy.
+        tpred = [m2s_xy(tp[:2]) for tp in matcher.Tpos]
+
+        def decorate(scene, x=x, y=y, target_s=target_s, dvs=desired_vel_s, tpred=tpred):
+            """Draw the target path + the motion-matching command as real 3D
+            geometry in the render (so it shows in the overhead chase, not on a
+            flat map). Called only for the chase camera, so ego RGB/depth are
+            left clean."""
+            # planned path: orange capsule strip on the floor
+            for a, b in zip(path3d[:-1], path3d[1:]):
+                _decor_connector(
+                    scene,
+                    mujoco.mjtGeom.mjGEOM_CAPSULE,
+                    0.03,
+                    [a[0], a[1], PATH_Z],
+                    [b[0], b[1], PATH_Z],
+                    PATH_RGBA,
+                )
+            # matcher's predicted command trajectory (magenta): robot -> Tpos
+            chain = [(x, y), *[(t[0], t[1]) for t in tpred]]
+            for a, b in zip(chain[:-1], chain[1:]):
+                _decor_connector(
+                    scene,
+                    mujoco.mjtGeom.mjGEOM_CAPSULE,
+                    0.02,
+                    [a[0], a[1], TPOS_Z],
+                    [b[0], b[1], TPOS_Z],
+                    TPOS_RGBA,
+                )
+            for t in tpred:
+                _decor_sphere(scene, [t[0], t[1], TPOS_Z], 0.05, TPOS_RGBA)
+            # pure-pursuit lookahead target (green sphere)
+            _decor_sphere(scene, [target_s[0], target_s[1], TARGET_Z], 0.12, TARGET_RGBA)
+            # command-velocity arrow (yellow): desiredVel direction, ~0.8 m long
+            if np.linalg.norm(dvs) > 1e-6:
+                u = dvs / np.linalg.norm(dvs)
+                _decor_connector(
+                    scene,
+                    mujoco.mjtGeom.mjGEOM_ARROW,
+                    0.05,
+                    [x, y, CMD_Z],
+                    [x + 0.8 * u[0], y + 0.8 * u[1], CMD_Z],
+                    CMD_RGBA,
+                )
+
+        rgb = render(data, "ego")[:, :, ::-1].copy()  # ego stays clean (no decor)
         rgb_frames.append(rgb)
         depth = colorize_depth(render(data, "ego", depth=True))
         depth_frames.append(depth)
 
         followcam.lookat[:] = [x, y, CHASE_LOOK_Z]
         followcam.azimuth = float(np.degrees(yaw))
-        follow = render(data, followcam)[:, :, ::-1].copy()
+        follow = render(data, followcam, decorate=decorate)[:, :, ::-1].copy()
         follow_frames.append(follow)
 
-        # --- top-down map: planned path (orange, baked in) + the motion-matching
-        # control overlay: lookahead target, command-velocity arrow, and the
-        # matcher's predicted command trajectory (its Tpos spring prediction).
+        # top-down map: just the planned path (baked in) + the robot pose marker.
         mp = map_base.copy()
         dot = world_to_panel(x, y)
         head = world_to_panel(x + 0.6 * np.cos(yaw), y + 0.6 * np.sin(yaw))
-        # matcher's predicted desired trajectory (Tpos), matcher frame -> scene
-        tpred = [world_to_panel(*m2s_xy(tp[:2])) for tp in matcher.Tpos]
-        cv2.polylines(
-            mp, [np.array([dot, *tpred], np.int32)], False, (220, 60, 200), 2, cv2.LINE_AA
-        )
-        for tp in tpred:
-            cv2.circle(mp, tp, 4, (220, 60, 200), -1, cv2.LINE_AA)
-        # lookahead target on the planned path (green)
-        cv2.circle(mp, world_to_panel(*target_s), 7, (0, 200, 0), 2, cv2.LINE_AA)
-        # command-velocity arrow (cyan): desiredVel direction, length ~0.8 m
-        if np.linalg.norm(desired_vel_s) > 1e-6:
-            u = desired_vel_s / np.linalg.norm(desired_vel_s)
-            cv2.arrowedLine(
-                mp,
-                dot,
-                world_to_panel(x + 0.8 * u[0], y + 0.8 * u[1]),
-                (230, 200, 0),
-                3,
-                cv2.LINE_AA,
-                tipLength=0.3,
-            )
         cv2.line(mp, dot, head, (40, 40, 40), 3, cv2.LINE_AA)
         cv2.circle(mp, dot, 8, (0, 0, 230), -1, cv2.LINE_AA)
 
-        top = np.hstack([label(mp, "Map: target + MM command"), label(follow, "Overhead chase")])
+        top = np.hstack([label(mp, "Top-down map"), label(follow, "Chase: target + MM command")])
         bot = np.hstack([label(rgb, "Ego RGB"), label(depth, "Ego depth")])
         combined.append(np.vstack([top, bot]))
 
