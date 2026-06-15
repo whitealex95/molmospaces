@@ -29,6 +29,7 @@ gen_trajectories.py orchestrates occupancy→plan→run_mujoco for N trajectorie
 | `build_occupancy_usd.py` | scene **USD** → the same grid, USD-native (optional; no MJCF/MuJoCo) |
 | `plan.py` | occupancy grid → clearance-aware A* path; reusable `Planner` class |
 | `run_mujoco.py` | scene + path → kinematic G1 + egocentric/chase render (MuJoCo) |
+| `run_mujoco_mm.py` | scene + path → **full-body motion-matched** G1 walk + egocentric/overhead render (MuJoCo) |
 | `run_isaac.py` | USD scene + path → G1 egocentric RGB+depth + chase render (IsaacSim) |
 | `gen_trajectories.py` | batch driver: N trajectories/scene, previews + index |
 
@@ -207,6 +208,57 @@ Scene + `path.npz` → the egocentric/chase video.
    Part 2 whose Simple Profile caps near 1280×720 and fails to play on the web
    for the 1280×960 panel. Falls back to `mp4v` only if `ffmpeg` is absent.
 
+## Stage 3 (full-body motion matching) — `run_mujoco_mm.py`
+
+A drop-in alternative to `run_mujoco.py` that renders a **walking gait** instead
+of a frozen-legged slide. `run_mujoco.py` sets only the floating base each step
+(the legs/arms never move); `run_mujoco_mm.py` instead sets **all 36 qpos** every
+frame from the motion-matching controller in `~/Projects/motionmatching-g1`
+(`mm_g1.controller.MotionMatcher`, a GenoView "Simple Motion Matching" port over a
+GMR-retargeted LAFAN1 walk/run/stumble library). Same A* `path.npz`, same ego
+camera rig, same combined-panel layout and H.264 encoding — only the robot's body
+is now articulated.
+
+1. **Merge the Menagerie G1** — `run_mujoco_mm.py` attaches
+   `~/Projects/motionmatching-g1/assets/unitree_g1/g1.xml` (NOT CAMDM's
+   `g1_29dof_rev_1_0.xml`). This is the exact model the matcher's 36-D qpos is
+   authored for — `qpos[0:3]` pelvis pos, `qpos[3:7]` pelvis quat (wxyz),
+   `qpos[7:36]` the 29 joints in declaration order. It happens to share the
+   `pelvis` / `floating_base_joint` / `torso_link` body names, so the ego-camera
+   mount code is byte-identical to `run_mujoco.py`.
+2. **Velocity control, not waypoint teleport** — the matcher is a velocity-driven
+   character: `matcher.step(desiredVel, desiredFace)` integrates its *own* world
+   root from the motion DB and returns a world-frame qpos; it cannot be placed on
+   an arbitrary path. So the script:
+   - Anchors a **rigid 2D transform `T`** (z-rotation + xy-translation) mapping
+     the matcher's reset pose onto the path's first waypoint with the path's
+     initial heading. Every output pose is mapped back to the scene frame by `T`
+     (xy by rotate+translate, the root quat by a left-multiplied yaw, joints
+     untouched).
+   - Steers with **pure pursuit**: each frame it aims `desiredVel` at a lookahead
+     point (`PURSUIT_LOOKAHEAD_M` 0.8 m) along the densified planned path,
+     expressed in the matcher frame via `T⁻¹`. `desiredFace` is left zero so the
+     robot faces its travel direction.
+3. **Drift is expected** — motion matching does not track the line exactly, so the
+   top-down panel draws **both** the planned path (orange polyline) and the
+   robot's *actual* position (red dot). Arrival is when the robot is within
+   `ARRIVE_TOL_M` (0.4 m) of the final waypoint; `desiredVel` then goes to zero
+   and the gait settles for `SETTLE_FRAMES` (45) before the run ends. A
+   `--max-frames` cap (auto-sized from path length) guards against a stuck pursuit.
+4. **More top-down overhead chase** — the chase camera sits higher and steeper
+   than `run_mujoco.py` (`CHASE_Z` 5.0 m, `CHASE_BACK` 1.5 m → ≈ −70° elevation)
+   so the full-body gait and the route are both clearly visible. **Use the
+   NON-ceiling scene variant** (`val_<N>.xml`, not `val_<N>_ceiling.xml`) so the
+   ceiling does not occlude this near-overhead view.
+5. **Envs** — the matcher is pure numpy + scipy (`cKDTree`) + mujoco, so it runs
+   in either `mlspaces-mujoco` (`--renderer opengl`) or `mlspaces`
+   (`--renderer filament`). The first run builds + caches the motion library
+   (`~/Projects/motionmatching-g1/data/motion_lib.npz`, ~5 MB).
+6. **Outputs** — identical filenames to `run_mujoco.py`
+   (`combined.mp4` + `ego_rgb/ego_depth/follow.mp4` + `combined_montage.png`),
+   written under `--out-dir`. Keep them in a **separate tree** (`nav_runs_mm/`,
+   gitignored) so the kinematic `nav_runs/` renders stay untouched.
+
 ## Stage 3 (IsaacSim) — `run_isaac.py`
 
 The IsaacSim counterpart of `run_mujoco.py`: drives a Unitree G1 along the same
@@ -311,6 +363,12 @@ nav_runs/<dataset>/
 ```
 `nav_runs/` lives at the repo root and is gitignored.
 
+`run_mujoco_mm.py` writes the same filenames into its own `--out-dir`. By
+convention that is a parallel tree `nav_runs_mm/<dataset>/<scene>/NN__.../`
+(also gitignored) so the full-body motion-matched renders never overwrite the
+kinematic `nav_runs/` ones. It reuses the *same* `occupancy.npz` / `path.npz`
+from `nav_runs/`, so no occupancy/plan rebuild is needed.
+
 `run_isaac.py` writes `isaac_{ego,depth,follow,combined}.mp4` +
 `isaac_combined_montage.png` into its `--out-dir`. It is invoked directly (not
 by `gen_trajectories.py`), so placement follows `--out-dir`: in the batches run
@@ -331,6 +389,10 @@ trajectory, beside the MuJoCo files) and the `<scene>/` dir itself for procthor
 | `SMOOTH_WINDOW` | run_mujoco | 45 | path moving-average window |
 | `YAW_ALPHA` | run_mujoco | 0.2 | heading low-pass (smaller = smoother) |
 | `CHASE_BACK / CHASE_Z / CHASE_LOOK_Z` | run_mujoco, run_isaac | 1.3, 2.3, 0.9 | interior chase camera offset (must stay below the ceiling) |
+| `CHASE_BACK / CHASE_Z / CHASE_LOOK_Z` | run_mujoco_mm | 1.5, 5.0, 0.9 | more-overhead chase (use the non-ceiling scene so it isn't occluded) |
+| `--speed` / `WALK_SPEED` | run_mujoco_mm | 1.3 | desired travel speed fed to the matcher's velocity springs |
+| `PURSUIT_LOOKAHEAD_M` | run_mujoco_mm | 0.8 | pure-pursuit lookahead along the planned path |
+| `ARRIVE_TOL_M` / `SETTLE_FRAMES` | run_mujoco_mm | 0.4, 45 | arrival radius + settle frames after stopping |
 | `G1_GROUND_Z` | run_isaac | 0.315 | G1 base height so soles rest on z=0 |
 | `MIN_LENGTH_M` | gen_trajectories | 2.0 | reject degenerate samples |
 
@@ -393,6 +455,18 @@ python scripts/navigation/plan.py --occupancy <dir>/occupancy.npz --out <dir>/pa
     [--start-room NAME --goal-room NAME]          # inspect <dir>/path_debug.png
 python scripts/navigation/run_mujoco.py --scene <scene.xml> --path <dir>/path.npz \
     --occupancy <dir>/occupancy.npz --out-dir <dir>
+```
+
+Full-body motion-matched walk (reuses the same `path.npz` / `occupancy.npz`;
+needs the `~/Projects/motionmatching-g1` repo on disk). Render to a separate
+tree and use the **non-ceiling** scene so the overhead chase isn't occluded:
+```bash
+python scripts/navigation/run_mujoco_mm.py \
+    --scene <scene.xml>                         `# NON-ceiling variant` \
+    --path nav_runs/<dataset>/<scene>/NN__.../path.npz \
+    --occupancy nav_runs/<dataset>/<scene>/occupancy.npz \
+    --out-dir nav_runs_mm/<dataset>/<scene>/NN__... \
+    [--renderer opengl|filament] [--speed 1.3]
 ```
 
 IsaacSim render — `run_isaac.py` consumes the **USD** scene and the *same*

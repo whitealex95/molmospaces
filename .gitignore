@@ -56,3 +56,4 @@ __pycache__/
 
 # navigation pipeline outputs (occupancy grids, planned paths, rendered videos)
 nav_runs/
+nav_runs_mm/
