@@ -8,8 +8,13 @@ plans any number of start/goal cell pairs; gen_trajectories.py uses it to
 batch-sample trajectories. Run as a script it plans one room->room path.
 
 Output: ``path.npz`` next to the occupancy grid:
-  waypoints   (N,2) float -- world (x,y) waypoints, start -> goal
-  start_room / goal_room  -- room names
+  waypoints      (N,2) float -- ROUNDED world (x,y) waypoints, start -> goal
+  waypoints_raw  (M,2) float -- the raw grid A* path before rounding
+  start_room / goal_room     -- room names
+
+A clearance-checked moving average rounds the staircase grid A* path so it is
+easier to follow (``--smooth`` window; 0 keeps the rigid path). The rounding
+never cuts a corner through a wall.
 
 Run from the ``mlspaces-mujoco`` env.
 """
@@ -42,6 +47,21 @@ def px_to_world(map_to_world, row, col):
     return (map_to_world @ np.array([row, col, 1.0]))[:2]  # -> (x, y)
 
 
+def resample_polyline(pts: np.ndarray, step: float) -> np.ndarray:
+    """Densify a polyline to ~`step`-spaced points (endpoints preserved)."""
+    pts = np.asarray(pts, float)
+    out = [pts[0]]
+    for a, b in zip(pts[:-1], pts[1:]):
+        seg = b - a
+        length = float(np.linalg.norm(seg))
+        if length < 1e-9:
+            continue
+        n = max(1, int(round(length / step)))
+        for i in range(1, n + 1):
+            out.append(a + seg * (i / n))
+    return np.array(out)
+
+
 class Planner:
     """Clearance-aware A* over a downscaled occupancy grid.
 
@@ -49,7 +69,7 @@ class Planner:
     coarse-cell pairs. Shared by this script's CLI and gen_trajectories.py.
     """
 
-    def __init__(self, occupancy_npz, agent_radius: float = 0.2):
+    def __init__(self, occupancy_npz, agent_radius: float = 0.2, smooth_strength: float = 0.5):
         o = np.load(occupancy_npz, allow_pickle=True)
         self.occ = o["occupancy"]  # bool, True = free
         self.room_map = o["room_map"]
@@ -58,11 +78,13 @@ class Planner:
         self.map_to_world = o["map_to_world"]
         self.px_per_m = float(o["px_per_m"])
         self.agent_radius = agent_radius
+        self.smooth_strength = smooth_strength  # path-rounding window (m); 0 disables
 
         # agent-radius clearance, then downscale (min-pool: a coarse cell is
         # free only if every fine cell is free).
         self.rad_px = max(1, int(round(agent_radius * self.px_per_m)))
         free = cv2.dilate((~self.occ).astype(np.uint8), circular_kernel(self.rad_px)) == 0
+        self.free_px = free  # agent-dilated free mask (full px res); used by smoothing
         ds = DOWNSCALE
         hd, wd = free.shape[0] // ds, free.shape[1] // ds
         self.grid = free[: hd * ds, : wd * ds].reshape(hd, ds, wd, ds).min(axis=(1, 3))
@@ -130,15 +152,68 @@ class Planner:
         length = float(np.linalg.norm(np.diff(waypoints, axis=0), axis=1).sum())
         return waypoints, length
 
+    def _free_at(self, x: float, y: float) -> bool:
+        """True if world point (x,y) is inside the agent-dilated free space."""
+        rc = self.world_to_map @ np.array([x, y, 0.0, 1.0])
+        r, c = int(round(rc[0])), int(round(rc[1]))
+        h, w = self.free_px.shape
+        return 0 <= r < h and 0 <= c < w and bool(self.free_px[r, c])
+
+    def smooth_waypoints(self, waypoints) -> np.ndarray:
+        """Round off the grid-staircase A* path with a clearance-checked moving
+        average, so the path is easier to follow (and looks round, not rigid).
+
+        Endpoints are pinned. Any point a smoothing pass would push into the
+        agent-dilated obstacle zone is pulled back toward the raw path until it
+        is free again -- so rounding never cuts a corner through a wall."""
+        waypoints = np.asarray(waypoints, float)
+        if self.smooth_strength <= 0 or len(waypoints) < 3:
+            return waypoints
+        step = self.grid_spacing * 0.5
+        pts = resample_polyline(waypoints, step)
+        if len(pts) < 3:
+            return pts
+        k = max(1, int(round(self.smooth_strength / step)))
+        out = pts.copy()
+        for _ in range(2):  # two passes -> noticeably rounder
+            cur = out.copy()
+            for i in range(1, len(out) - 1):
+                lo, hi = max(0, i - k), min(len(out), i + k + 1)
+                cand = cur[lo:hi].mean(axis=0)
+                if self._free_at(cand[0], cand[1]):
+                    out[i] = cand
+                    continue
+                for t in (0.66, 0.33):  # blend back toward the raw point
+                    c2 = t * cand + (1 - t) * cur[i]
+                    if self._free_at(c2[0], c2[1]):
+                        out[i] = c2
+                        break
+            out[0], out[-1] = pts[0], pts[-1]
+        return out
+
     def save_path(self, out, waypoints, start_room: str, goal_room: str) -> None:
-        """Write ``path.npz`` and a ``*_debug.png`` overlay next to it."""
+        """Write ``path.npz`` and a ``*_debug.png`` overlay next to it.
+
+        ``waypoints`` in the npz is the **rounded** path (what runtimes follow);
+        the raw grid A* path is kept as ``waypoints_raw`` for reference."""
         out = Path(out)
-        np.savez(out, waypoints=waypoints, start_room=start_room, goal_room=goal_room)
+        raw = np.asarray(waypoints, float)
+        smooth = self.smooth_waypoints(raw)
+        np.savez(
+            out,
+            waypoints=smooth,
+            waypoints_raw=raw,
+            start_room=start_room,
+            goal_room=goal_room,
+        )
         vis = np.where(self.occ[..., None], 235, 40).astype(np.uint8).repeat(3, axis=2)
-        pts = np.array([world_to_px(self.world_to_map, x, y)[::-1] for x, y in waypoints], np.int32)
-        cv2.polylines(vis, [pts], False, (0, 140, 255), max(2, self.rad_px // 3), cv2.LINE_AA)
-        cv2.circle(vis, tuple(pts[0]), self.rad_px, (0, 200, 0), -1, cv2.LINE_AA)
-        cv2.circle(vis, tuple(pts[-1]), self.rad_px, (0, 0, 230), -1, cv2.LINE_AA)
+        raw_pts = np.array([world_to_px(self.world_to_map, x, y)[::-1] for x, y in raw], np.int32)
+        sm_pts = np.array([world_to_px(self.world_to_map, x, y)[::-1] for x, y in smooth], np.int32)
+        # raw A* path faint grey underneath, rounded path bold orange on top.
+        cv2.polylines(vis, [raw_pts], False, (120, 120, 120), max(1, self.rad_px // 5), cv2.LINE_AA)
+        cv2.polylines(vis, [sm_pts], False, (0, 140, 255), max(2, self.rad_px // 3), cv2.LINE_AA)
+        cv2.circle(vis, tuple(sm_pts[0]), self.rad_px, (0, 200, 0), -1, cv2.LINE_AA)
+        cv2.circle(vis, tuple(sm_pts[-1]), self.rad_px, (0, 0, 230), -1, cv2.LINE_AA)
         cv2.imwrite(str(out.with_name(out.stem + "_debug.png")), vis)
 
 
@@ -158,10 +233,29 @@ def main() -> int:
     ap.add_argument(
         "--out", type=Path, default=None, help="output path.npz (default: next to occupancy)"
     )
+    ap.add_argument(
+        "--smooth",
+        type=float,
+        default=0.5,
+        help="path-rounding window in metres (0 = rigid grid A* path)",
+    )
+    ap.add_argument(
+        "--resmooth",
+        type=Path,
+        default=None,
+        help="round an EXISTING path.npz in place (uses its waypoints_raw if present) and exit",
+    )
     args = ap.parse_args()
 
-    planner = Planner(args.occupancy, args.agent_radius)
+    planner = Planner(args.occupancy, args.agent_radius, smooth_strength=args.smooth)
     print(f"A* graph: {planner.graph.number_of_nodes()} navigable nodes")
+
+    if args.resmooth is not None:
+        p = np.load(args.resmooth, allow_pickle=True)
+        raw = p["waypoints_raw"] if "waypoints_raw" in p else p["waypoints"]
+        planner.save_path(args.resmooth, raw, str(p["start_room"]), str(p["goal_room"]))
+        print(f"re-smoothed (window {args.smooth} m) -> {args.resmooth}")
+        return 0
 
     groups = planner.connectivity()
     print(f"Room connectivity ({len(groups)} group(s); rooms in a group are mutually reachable):")

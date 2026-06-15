@@ -142,10 +142,24 @@ them per scene with `install_scene_with_objects_and_grasps_from_path` (see
 
 `plan(start_cell, goal_cell)` runs A* (`make_discrete_path`) and returns world
 waypoints + length, or `None` if the cells are in different components.
+
+**Path rounding** — raw grid A* produces a staircase of grid-aligned steps that
+is rigid and awkward to follow. `save_path()` rounds it with
+`smooth_waypoints()` — a clearance-checked moving average (`--smooth` window,
+default 0.5 m): it densifies the path and averages each point over the window,
+but **pulls any point that would land in the agent-dilated obstacle zone back
+toward the raw path** until it is free again, so rounding never cuts a corner
+through a wall. `path.npz` stores the **rounded** `waypoints` (what every runtime
+follows) plus `waypoints_raw` (the original A* path); `path_debug.png` draws the
+rounded path bold over the faint raw staircase. `--smooth 0` keeps the rigid
+path. `gen_trajectories.py`'s `topdown.png` draws the same rounded path.
+
 `save_path()` writes `path.npz` + a `path_debug.png` overlay.
 
 CLI default: start = largest reachable room's anchor, goal = farthest reachable
-room; `--start-room` / `--goal-room` override by name substring.
+room; `--start-room` / `--goal-room` override by name substring. `--resmooth
+<path.npz>` re-rounds an *existing* path in place (using its `waypoints_raw`),
+e.g. to re-round paths planned before smoothing was added or with a new window.
 
 ## Stage 3 — `run_mujoco.py`
 
@@ -302,7 +316,9 @@ Batches the three stages for one scene; run once per scene.
 | `map_to_world` | (2,3) float | `[row,col,1] → [x,y]` |
 | `px_per_m` | float | grid resolution |
 
-`path.npz` — `waypoints` (N,2) world (x,y) start→goal; `start_room`, `goal_room`.
+`path.npz` — `waypoints` (N,2) world (x,y) start→goal, **rounded** (clearance-
+checked); `waypoints_raw` (M,2) the raw grid A* path before rounding;
+`start_room`, `goal_room`.
 
 `index.json` (one per dataset) — `{dataset, updated, trajectories: [...]}`; each
 trajectory: `id, scene, scene_xml, dir, start_room, goal_room, start_xy,
@@ -338,6 +354,7 @@ trajectory, beside the MuJoCo files) and the `<scene>/` dir itself for procthor
 | `WALL_THICKNESS_M` | build_occupancy | 0.12 | burned-in wall width |
 | `DOOR_CARVE_M` | build_occupancy | 0.6 | doorway opening width |
 | `--agent-radius` | plan / gen | 0.2 | obstacle dilation; keep modest so doorways stay open |
+| `--smooth` | plan / gen | 0.5 | path-rounding window (m); 0 = rigid grid A* path |
 | `DOWNSCALE` | plan | 5 | occupancy cells per A* cell |
 | `SPEED`, `STEP_HZ` | run_mujoco | 1.0, 30 | travel speed, render rate |
 | `SMOOTH_WINDOW` | run_mujoco | 45 | path moving-average window |
@@ -354,6 +371,13 @@ trajectory, beside the MuJoCo files) and the `<scene>/` dir itself for procthor
   visual floor geoms); the procthor collision `floor` geom is excluded.
 - **Walls / doors** must be burned in / carved out — a straight-down render
   alone misses vertical walls and seals doorways.
+- **Path rounding ≠ runtime smoothing** — the rigid look of the *raw* grid A*
+  path is rounded once at plan time (`save_path` → `path.npz` `waypoints`), so
+  `path_debug.png` / `topdown.png` and every runtime follow the same rounded
+  line. `run_mujoco.py` additionally moving-average-smooths at runtime (it
+  re-smooths the already-rounded path, harmlessly); `run_mujoco_mm.py` follows
+  the rounded `path.npz` directly. Rounding is clearance-checked, so it never
+  cuts through a wall.
 - **Filament ignores the MuJoCo headlight** — the run uses a robot-mounted fill
   light for the Filament backend.
 - **Video codec** — emit H.264, not OpenCV `mp4v`; the 1280×960 panel exceeds

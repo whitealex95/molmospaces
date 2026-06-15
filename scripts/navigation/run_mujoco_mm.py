@@ -300,6 +300,78 @@ def write_video(path, frames, fps=STEP_HZ):
     vw.release()
 
 
+def build_segments(idx_log, clip_id, frame_in_clip, skill):
+    """Run-length-encode the per-frame DB index into motion-matching segments.
+
+    Between searches the matcher just advances its playhead by +1, so a run of
+    contiguous, same-clip DB indices is exactly "play clip C from frame F and
+    step forward N frames". A non-contiguous jump (an inertialized search cut, or
+    a triggered jump) starts a new segment. Returns (S,4) int64 rows of
+    [clip_id, start_frame_in_clip, n_steps, is_jump]."""
+    idx = np.asarray(idx_log)
+    segs = []
+    start = 0
+    for i in range(1, len(idx) + 1):
+        contiguous = (
+            i < len(idx) and idx[i] == idx[i - 1] + 1 and clip_id[idx[i]] == clip_id[idx[i - 1]]
+        )
+        if not contiguous:
+            g = idx[start]
+            segs.append([int(clip_id[g]), int(frame_in_clip[g]), i - start, int(skill[g])])
+            start = i
+    return np.array(segs, np.int64).reshape(-1, 4)
+
+
+def save_motion(
+    out_dir, qpos, idx_log, cmd_log, clip_id, frame_in_clip, skill, clip_names, traj, meta
+):
+    """Save the FULL per-frame motion and the MINIMAL motion-matching control
+    stream, then print a size comparison (the compression the matcher buys).
+
+    full   -- motion_full.npz: qpos (T,36) world poses + command + DB index/frame.
+    minimal -- motion_min.npz: the A* trajectory + RLE motion-index segments
+               (clip, start-frame, n-steps-forward, is-jump) + the anchor
+               transform. The full pose stream reconstructs from these by
+               replaying the segments against the motion library."""
+    T = len(qpos)
+    segments = build_segments(idx_log, clip_id, frame_in_clip, skill)
+    n_jumps = int((segments[:, 3] == 1).sum()) if len(segments) else 0
+
+    np.savez_compressed(
+        out_dir / "motion_full.npz",
+        qpos=qpos.astype(np.float32),  # (T,36) scene-frame full body pose
+        command_vel=cmd_log.astype(np.float32),  # (T,2) desiredVel fed to the matcher
+        db_index=idx_log.astype(np.int64),  # (T,) global motion-DB frame per pose
+        fps=np.float32(meta["fps"]),
+    )
+    np.savez_compressed(
+        out_dir / "motion_min.npz",
+        trajectory=traj.astype(np.float32),  # (N,2) the A* path (the "where to go")
+        segments=segments,  # (S,4) [clip_id, start_frame_in_clip, n_steps, is_jump]
+        clip_names=np.array(clip_names, object),
+        dtheta=np.float32(meta["dtheta"]),  # anchor transform (matcher frame -> scene)
+        m0=np.asarray(meta["m0"], np.float32),
+        s0=np.asarray(meta["s0"], np.float32),
+        start_frame=np.int64(meta["start_frame"]),
+        fps=np.float32(meta["fps"]),
+    )
+
+    # Logical (uncompressed) representation sizes -- the fair compression metric.
+    full_logical = qpos.astype(np.float32).nbytes
+    min_logical = segments.nbytes + traj.astype(np.float32).nbytes + 64
+    full_disk = (out_dir / "motion_full.npz").stat().st_size
+    min_disk = (out_dir / "motion_min.npz").stat().st_size
+    print(
+        f"motion: {T} frames in {len(segments)} segment(s), {n_jumps} jump(s)\n"
+        f"  full    (qpos {T}x36 f32): {full_logical / 1024:8.1f} KiB logical | "
+        f"{full_disk / 1024:7.1f} KiB on disk -> motion_full.npz\n"
+        f"  minimal (traj + segments): {min_logical / 1024:8.1f} KiB logical | "
+        f"{min_disk / 1024:7.1f} KiB on disk -> motion_min.npz\n"
+        f"  compression: {full_logical / max(min_logical, 1):.1f}x logical, "
+        f"{full_disk / max(min_disk, 1):.1f}x on disk"
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -344,6 +416,18 @@ def main() -> int:
     path_len = float(np.sum(np.linalg.norm(np.diff(planned, axis=0), axis=1)))
 
     matcher = load_matcher(args.mm_root)
+    # Motion-library index tables for the compact ("minimal") representation:
+    # which DB frame each output pose came from, its clip, and its frame-in-clip.
+    start_frame = int(matcher.animFrame)  # the matcher's reset playhead (global DB index)
+    clip_id = np.asarray(matcher.lib["clip_id"])
+    skill = np.asarray(matcher.skill)
+    if "frame_in_clip" in matcher.lib:
+        frame_in_clip = np.asarray(matcher.lib["frame_in_clip"])
+    else:  # derive from clip-id run boundaries
+        frame_in_clip = np.zeros(len(clip_id), np.int32)
+        for ci in np.unique(clip_id):
+            frame_in_clip[clip_id == ci] = np.arange(int(np.sum(clip_id == ci)))
+    clip_names = [str(s) for s in matcher.lib["clip_names"]] if "clip_names" in matcher.lib else []
 
     # --- Rigid transform: matcher frame -> scene frame, anchored at path start.
     # The matcher resets to some world pose from its motion DB; map that onto the
@@ -391,6 +475,7 @@ def main() -> int:
     )
 
     rgb_frames, depth_frames, follow_frames, combined = [], [], [], []
+    qpos_log, idx_log, cmd_log = [], [], []  # full pose, DB index, command velocity (scene)
     settle = 0
     nframes = 0
     while nframes < max_frames:
@@ -402,14 +487,17 @@ def main() -> int:
             closest >= len(planned) - 2 and np.linalg.norm(planned[-1] - robot_s) < ARRIVE_TOL_M
         )
         if arrived:
-            desired_vel_m = np.zeros(3)  # stop -> matcher settles to idle
+            target_s = planned[-1]
+            desired_vel_s = np.zeros(2)  # stop -> matcher settles to idle
+            desired_vel_m = np.zeros(3)
             settle += 1
         else:
             target_s = planned[min(closest + lookahead_steps, len(planned) - 1)]
             dir_s = target_s - robot_s
             nrm = np.linalg.norm(dir_s)
-            dir_m = Rinv @ (dir_s / nrm) if nrm > 1e-6 else np.zeros(2)
-            desired_vel_m = np.array([dir_m[0], dir_m[1], 0.0]) * args.speed
+            unit_s = dir_s / nrm if nrm > 1e-6 else np.zeros(2)
+            desired_vel_s = unit_s * args.speed  # command, scene frame (for viz/log)
+            desired_vel_m = np.array([*(Rinv @ unit_s), 0.0]) * args.speed  # matcher frame
 
         qm = matcher.step(desired_vel_m, [0.0, 0.0, 0.0])  # face = follow velocity
 
@@ -420,6 +508,10 @@ def main() -> int:
         qscene[3:7] = quat_mul(dquat, qm[3:7])
         data.qpos[base_adr : base_adr + 36] = qscene
         mujoco.mj_forward(model, data)
+
+        qpos_log.append(qscene.astype(np.float32))
+        idx_log.append(int(matcher.animFrame))  # which DB frame produced this pose
+        cmd_log.append(desired_vel_s.astype(np.float32))
 
         x, y = float(qscene[0]), float(qscene[1])
         yaw = matcher.rootYaw + dtheta
@@ -434,13 +526,37 @@ def main() -> int:
         follow = render(data, followcam)[:, :, ::-1].copy()
         follow_frames.append(follow)
 
+        # --- top-down map: planned path (orange, baked in) + the motion-matching
+        # control overlay: lookahead target, command-velocity arrow, and the
+        # matcher's predicted command trajectory (its Tpos spring prediction).
         mp = map_base.copy()
         dot = world_to_panel(x, y)
         head = world_to_panel(x + 0.6 * np.cos(yaw), y + 0.6 * np.sin(yaw))
+        # matcher's predicted desired trajectory (Tpos), matcher frame -> scene
+        tpred = [world_to_panel(*m2s_xy(tp[:2])) for tp in matcher.Tpos]
+        cv2.polylines(
+            mp, [np.array([dot, *tpred], np.int32)], False, (220, 60, 200), 2, cv2.LINE_AA
+        )
+        for tp in tpred:
+            cv2.circle(mp, tp, 4, (220, 60, 200), -1, cv2.LINE_AA)
+        # lookahead target on the planned path (green)
+        cv2.circle(mp, world_to_panel(*target_s), 7, (0, 200, 0), 2, cv2.LINE_AA)
+        # command-velocity arrow (cyan): desiredVel direction, length ~0.8 m
+        if np.linalg.norm(desired_vel_s) > 1e-6:
+            u = desired_vel_s / np.linalg.norm(desired_vel_s)
+            cv2.arrowedLine(
+                mp,
+                dot,
+                world_to_panel(x + 0.8 * u[0], y + 0.8 * u[1]),
+                (230, 200, 0),
+                3,
+                cv2.LINE_AA,
+                tipLength=0.3,
+            )
         cv2.line(mp, dot, head, (40, 40, 40), 3, cv2.LINE_AA)
         cv2.circle(mp, dot, 8, (0, 0, 230), -1, cv2.LINE_AA)
 
-        top = np.hstack([label(mp, "Top-down map"), label(follow, "Overhead chase")])
+        top = np.hstack([label(mp, "Map: target + MM command"), label(follow, "Overhead chase")])
         bot = np.hstack([label(rgb, "Ego RGB"), label(depth, "Ego depth")])
         combined.append(np.vstack([top, bot]))
 
@@ -459,6 +575,21 @@ def main() -> int:
     tiles = [cv2.resize(combined[i], (640, 480)) for i in idx]
     sheet = np.vstack([np.hstack(tiles[0:3]), np.hstack(tiles[3:6])])
     cv2.imwrite(str(out_dir / "combined_montage.png"), sheet)
+
+    save_motion(
+        out_dir,
+        np.array(qpos_log),
+        np.array(idx_log, np.int64),
+        np.array(cmd_log),
+        clip_id,
+        frame_in_clip,
+        skill,
+        clip_names,
+        p["waypoints_raw"].astype(np.float32)
+        if "waypoints_raw" in p
+        else waypoints.astype(np.float32),
+        dict(dtheta=dtheta, m0=m0, s0=s0, start_frame=start_frame, fps=STEP_HZ),
+    )
 
     print(f"wrote {len(combined)} frames -> {out_dir}/combined.mp4 (+ individual streams)")
     return 0

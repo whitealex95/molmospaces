@@ -96,6 +96,22 @@ exactly. The top-down panel therefore draws **both** the planned path (orange
 polyline) and the robot's *actual* position (red dot), so the gap is visible
 rather than hidden.
 
+### Control overlay on the top-down panel
+
+So the motion-matching command is legible at a glance, the top-down map panel
+(labelled `Map: target + MM command`) overlays the full control state each
+frame:
+
+- **orange polyline** — the (rounded) planned path, baked into the static panel.
+- **red dot + grey stub** — the robot's actual pelvis position and heading.
+- **green ring** — the pure-pursuit **lookahead target** on the planned path.
+- **cyan arrow** — the **command input** `desiredVel` handed to `matcher.step`
+  (the direction the controller is being told to go, ~0.8 m long).
+- **magenta dots + line** — the matcher's own **predicted command trajectory**
+  (`matcher.Tpos`, its critically-damped spring prediction at the `HORIZONS`
+  taps), mapped from the matcher frame into the scene. This is what the search
+  query is built against, so it shows where the controller "thinks" it is headed.
+
 **Arrival / termination** — when the robot is within `ARRIVE_TOL_M` (0.4 m) of
 the final waypoint, `desiredVel` goes to zero and the gait settles for
 `SETTLE_FRAMES` (45) before the run ends. A `--max-frames` cap (auto-sized from
@@ -161,7 +177,49 @@ motion-matched renders never overwrite the kinematic `nav_runs/` ones:
 ```
 nav_runs_mm/<dataset>/<scene>/NN__<start>__to__<goal>/
   combined.mp4  ego_rgb.mp4  ego_depth.mp4  follow.mp4  combined_montage.png
+  motion_full.npz  motion_min.npz                       # saved motion (below)
 ```
+
+## Saved motion: full sequence vs minimal control stream
+
+Each run also saves the produced motion in **two** representations so you can
+measure how much the motion-matching controller compresses a walk. The point:
+the dense per-frame body pose is largely *implied* by a short path plus the few
+motion-library segments the matcher stitched together.
+
+**`motion_full.npz`** — the complete per-frame motion:
+
+| key | shape / type | meaning |
+|---|---|---|
+| `qpos` | (T,36) float32 | scene-frame full-body pose per frame (7 root + 29 joints) |
+| `command_vel` | (T,2) float32 | the `desiredVel` command fed to the matcher each frame |
+| `db_index` | (T,) int64 | global motion-DB frame index each pose came from |
+| `fps` | float32 | 30 |
+
+**`motion_min.npz`** — the minimal control stream the full motion reconstructs from:
+
+| key | shape / type | meaning |
+|---|---|---|
+| `trajectory` | (N,2) float32 | the A* path (raw waypoints) — *where to go* |
+| `segments` | (S,4) int64 | `[clip_id, start_frame_in_clip, n_steps, is_jump]` per run |
+| `clip_names` | (n_clips,) str | name for each `clip_id` |
+| `dtheta`,`m0`,`s0`,`start_frame` | scalars/(2,) | anchor transform (matcher frame → scene) |
+| `fps` | float32 | 30 |
+
+`segments` is a **run-length encoding of `db_index`**: between searches the
+matcher just advances its playhead by +1, so a contiguous same-clip run is
+exactly "*play clip C from frame F and step forward N frames*". A search cut (or
+a triggered jump) starts a new segment; `is_jump` flags jump-skill segments
+(`every jump`). So a whole trajectory collapses to the path plus a handful of
+`(clip, start-frame, n-steps-forward, jump?)` rows.
+
+At the end of a run the script prints the comparison — logical (uncompressed
+array bytes, the fair metric) and on-disk (`.npz`) sizes plus the ratio. For the
+example 889-frame walk: full ≈ 125 KiB vs minimal ≈ 3.4 KiB logical → **~37×**
+(≈ 51× on disk). The full `qpos` reconstructs by replaying the `segments`
+against the motion library (joint angles come straight from the indexed DB
+frames; the root re-integrates under the same command), placed into the scene by
+the stored transform.
 
 The `occupancy.npz` / `path.npz` are read straight from the existing
 `nav_runs/<dataset>/<scene>/...`, so no occupancy/plan rebuild is needed.
@@ -210,6 +268,6 @@ conda run -n mlspaces python scripts/navigation/run_mujoco_mm.py \
     --occupancy <…/occupancy.npz> --out-dir <nav_runs_mm/…> --renderer filament
 ```
 
-Example generated so far: procthor-10k-val `val_2`, room-2 → room-11 (27 m) →
-`nav_runs_mm/procthor-10k-val/val_2/01__room-2__to__room-11/` (772 frames,
-1280×960 H.264).
+Example generated so far: procthor-10k-val `val_2`, room-2 → room-11 (rounded
+~25 m path) → `nav_runs_mm/procthor-10k-val/val_2/01__room-2__to__room-11/`
+(889 frames, 1280×960 H.264; 99 motion segments, ~37× full→minimal compression).

@@ -65,7 +65,10 @@ def save_topdown(planner: Planner, waypoints, out_path, title: str) -> None:
     for i in range(1, n + 1):
         img[room_map == i] = colors[i - 1]
 
-    pts = np.array([world_to_px(planner.world_to_map, x, y)[::-1] for x, y in waypoints], np.int32)
+    # draw the ROUNDED path (what the runtimes actually follow), not the raw
+    # grid staircase -- keeps topdown.png consistent with path.npz / the renders.
+    smooth = planner.smooth_waypoints(waypoints)
+    pts = np.array([world_to_px(planner.world_to_map, x, y)[::-1] for x, y in smooth], np.int32)
     cv2.polylines(img, [pts], False, (30, 90, 240), 6, cv2.LINE_AA)
     cv2.circle(img, tuple(pts[0]), 13, (0, 180, 0), -1, cv2.LINE_AA)
     cv2.circle(img, tuple(pts[-1]), 13, (0, 0, 220), -1, cv2.LINE_AA)
