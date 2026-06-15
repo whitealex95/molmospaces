@@ -41,26 +41,47 @@ sys.path.insert(0, str(MM_ROOT))
 from mm_g1.controller import MotionMatcher
 from mm_g1.data import load_library
 
-matcher = MotionMatcher(load_library())        # builds data/motion_lib.npz on first use (~5 MB), then caches
-qpos = matcher.step(desiredVel, desiredFace)    # advance one 30 Hz frame; returns world-frame (36,) qpos
+matcher = MotionMatcher(load_library())          # builds data/motion_lib.npz on first use (~5 MB), then caches
+qpos = matcher.step(desiredVel, desiredFace)      # velocity-driven: advance one 30 Hz frame
+qpos = matcher.step_targets(Tpos, Tdir)           # path-driven: future targets handed in directly
 ```
 
-- **`matcher.step(desiredVel, desiredFace)`** — `desiredVel` is a desired velocity
-  `[vx, vy, 0]` in m/s (world frame); `desiredFace` is an independent facing
-  direction `[fx, fy, 0]` (zero ⇒ face the travel direction). It integrates the
-  matcher's **own** world root from the motion database and returns the 36-D
-  MuJoCo `qpos`: `qpos[0:3]` pelvis position, `qpos[3:7]` pelvis quaternion
-  (wxyz), `qpos[7:36]` the 29 joint angles (radians, declaration order).
+Internally `MotionMatcher.step` is **decoupled into two halves** (a non-breaking
+refactor; `step`'s behaviour is byte-identical to before):
+
+- `_predict_trajectory(desiredVel, desiredFace)` — spring-predict the future
+  trajectory query (`Tpos` / `Tdir` at the `HORIZONS` taps) from a desired velocity.
+- `_query_from_trajectory()` — match (per-clip KD-tree search) → advance the
+  playhead → integrate the root → reconstruct the pose, from whatever query is set.
+
+`step` runs *predict → jump-trigger → query*; `step_targets` runs *set-targets →
+query*, reusing the same query half (no copy-paste). The two entry points map onto
+the script's two `--query-mode`s:
+
+- **`matcher.step(desiredVel, desiredFace)`** (`--query-mode velocity`) — `desiredVel`
+  is a desired velocity `[vx, vy, 0]` in m/s (matcher frame); `desiredFace` is an
+  independent facing direction `[fx, fy, 0]` (zero ⇒ face the travel direction). The
+  matcher's springs predict the future-target query from it.
+- **`matcher.step_targets(Tpos, Tdir)`** (`--query-mode targets`, **default**) — the
+  future trajectory is supplied **directly**: `Tpos` `(len(HORIZONS), 3)` world-frame
+  target positions and `Tdir` the matching facing directions, one per horizon tap.
+  No velocity middle-man — you hand in *where the character should be along the path*.
+
+Both return the 36-D MuJoCo `qpos`: `qpos[0:3]` pelvis position, `qpos[3:7]` pelvis
+quaternion (wxyz), `qpos[7:36]` the 29 joint angles (radians, declaration order), and
+both update `matcher.Tpos` (the query trajectory, read back for the overlay).
+
 - **`matcher.rootPos` / `matcher.rootYaw`** — the controller's smoothed ground
   root (xy + heading) that the script reads each frame to steer and to map poses
   back into the scene.
 
 Fixed at **30 Hz** (`STEP_HZ`); one `step()` = one rendered frame.
 
-## How the A\* path drives a velocity-controlled character
+## How the A\* path drives the matcher
 
-The matcher is **velocity-controlled** — it cannot be teleported onto an
-arbitrary path. `run_mujoco_mm.py` bridges the gap in two parts:
+The matcher runs its **own** world root from the motion database — it cannot be
+teleported onto an arbitrary path. `run_mujoco_mm.py` bridges the gap with a
+rigid anchor plus one of two steering modes (`--query-mode`).
 
 ### 1. Rigid frame anchoring (matcher frame ↔ scene frame)
 
@@ -78,29 +99,63 @@ waypoint with the path's initial heading:
   frame): `xy = R(−dθ)·(p − s0) + m0`.
 
 Because `T` is rigid, headings and velocities transform consistently, so the
-robot reproduces the path *shape* in the scene frame.
+robot reproduces the path *shape* in the scene frame. The anchor `s0` (the path's
+first waypoint) is closed over by `m2s_xy` / `s2m_xy` — do **not** shadow that
+name with a local (an earlier targets-mode bug reassigned `s0` to a scalar
+arc-length, silently corrupting the whole scene↔matcher map; the projection
+arc-length is now named `s_proj`).
 
-### 2. Pure-pursuit steering
+### 2a. Target steering (`--query-mode targets`, default)
 
-Each frame the script:
+The cleaner path-follower: instead of a velocity, hand the matcher the future
+**trajectory** it would otherwise spring-predict. Each frame the script:
+
+1. Densifies the planned path to `PATH_STEP_M` (0.1 m) spacing and finds the
+   robot's closest path point (its **projection**, arc-length `s_proj`).
+2. Samples three **centerline** points ahead of the projection at
+   `s_proj + --speed × [1/3, 2/3, 1] s` — the matcher's three `HORIZONS` taps.
+3. **Off-path merge blend:** adds the robot's residual cross-track offset
+   `err = robot − projection` to each centerline point, weighted `w: 1 → 0`
+   linearly over `CONVERGE_TIME_S` (`w = max(0, 1 − t / CONVERGE_TIME_S)`). The
+   near tap keeps most of the offset (sits beside the robot, a little ahead); the
+   far tap drops to zero (on the line). Each facing is taken from the resulting
+   approach chain `robot → t₁ → t₂ → t₃`, so the heading curves diagonally in and
+   straightens onto the path.
+4. Maps the targets + facings into the matcher frame (`T⁻¹`) and feeds them
+   straight to `matcher.step_targets(Tpos, Tdir)`.
+
+Why the blend: sampling **pure centerline** points (no blend) silently assumes
+zero lateral error — the whole `--speed × t` budget goes to along-path progress,
+so a robot 0.5 m off the line is told to be *on* the line 1/3 s ahead, i.e. an
+≈1.8 m/s instantaneous snap (and the nearest tap may not even be reachable). The
+decaying-offset blend turns that into a smooth diagonal **merge** spread over
+`CONVERGE_TIME_S` (the same case drops to ≈1.1 m/s, uniform across taps). When the
+robot is on the line (`err ≈ 0`) the blend is a no-op and step 3 reduces exactly
+to the centerline samples. In practice it **tracks the path tightly** (≈0.1 m
+mean, ≤0.4 m max lateral drift on the val_2 example) — much closer than velocity
+mode — while degrading gracefully from large off-path states.
+
+### 2b. Pure-pursuit velocity steering (`--query-mode velocity`)
+
+The original mode. Each frame the script:
 
 1. Densifies the planned path to `PATH_STEP_M` (0.1 m) spacing.
 2. Finds the **lookahead point** by the classic pure-pursuit rule
    (`pure_pursuit_target`): the forward intersection of the circle of radius
-   `L = --speed × LOOKAHEAD_TIME_S` (default 1.0 s, so ≈1.3 m at 1.3 m/s — tied
+   `L = --speed × LOOKAHEAD_TIME_S` (default 1.0 s, so ≈1.0 m at 1.0 m/s — tied
    to the matcher's 1 s trajectory horizon) about the robot with the planned
    path. Scanning forward from the closest path point, it is the first point at
    distance ≥ L. If the robot has drifted >L off the path it targets the nearest
    path point (steer back on); near the goal it targets the final waypoint.
 3. Sets `desiredVel` toward that lookahead (in the matcher frame via `T⁻¹`),
-   scaled to `--speed`. `desiredFace` is left zero so the robot faces its travel
-   direction. The matcher's springs turn this velocity into the actual
-   future-target query — the robot is never driven *to* the lookahead point;
-   it only sets the instantaneous desired heading.
+   scaled to `--speed`, and calls `matcher.step(desiredVel, 0)`. `desiredFace` is
+   left zero so the robot faces its travel direction. The matcher's springs turn
+   this velocity into the future-target query — the robot is never driven *to*
+   the lookahead point; it only sets the instantaneous desired heading.
 
-**Drift is expected and realistic** — motion matching does not track the line
-exactly. The top-down panel therefore draws **both** the planned path (orange
-polyline) and the robot's *actual* position (red dot), so the gap is visible
+**Drift is larger and expected here** — velocity steering does not track the line
+exactly. Either way the top-down panel draws **both** the planned path (orange
+polyline) and the robot's *actual* position (red dot), so any gap is visible
 rather than hidden.
 
 ### Control overlay — drawn in-scene, in the overhead chase
@@ -245,9 +300,11 @@ The `occupancy.npz` / `path.npz` are read straight from the existing
 
 | Constant | Default | Effect |
 |---|---|---|
-| `--speed` / `WALK_SPEED` | 1.3 | desired travel speed fed to the matcher's velocity springs (m/s) |
-| `LOOKAHEAD_TIME_S` | 1.0 | pure-pursuit lookahead time; circle radius L = `--speed` × this |
-| `PATH_STEP_M` | 0.1 | densification spacing for the pursuit target |
+| `--query-mode` | `targets` | `targets` (path trajectory → `step_targets`, tight tracking) or `velocity` (pure-pursuit → `step`) |
+| `--speed` / `WALK_SPEED` | 1.0 | desired travel speed fed to the matcher (m/s); sets target spacing (targets) or `desiredVel` magnitude (velocity) |
+| `LOOKAHEAD_TIME_S` | 1.0 | pure-pursuit lookahead time (velocity mode only); circle radius L = `--speed` × this |
+| `PATH_STEP_M` | 0.1 | densification spacing for the target/pursuit path |
+| `CONVERGE_TIME_S` | 1.0 | targets mode: horizon over which an off-path lateral offset decays to zero (merge-onto-path rate); larger ⇒ gentler/more feasible cut-in |
 | `ARRIVE_TOL_M` | 0.4 | radius around the final waypoint counting as arrived |
 | `SETTLE_FRAMES` | 45 | extra frames (`desiredVel`=0) after arrival so the gait settles |
 | `--max-frames` | auto | hard frame cap (0 ⇒ path-length × 2 + 120) |
@@ -262,8 +319,13 @@ The `occupancy.npz` / `path.npz` are read straight from the existing
   `val_<N>.xml`, not the `_ceiling` variant.
 - **`~/Projects/motionmatching-g1` must be on disk** — the script inserts it on
   `sys.path` and imports `mm_g1`; the first run builds `data/motion_lib.npz`.
-- **Drift, not a bug** — the robot will not hug the planned line; the top-down
-  panel intentionally shows planned (orange) vs actual (red).
+- **Drift, not a bug** — in `velocity` mode the robot will not hug the planned
+  line; the top-down panel intentionally shows planned (orange) vs actual (red).
+  `targets` mode (the default) tracks the line tightly (≈0.1 m), but the same
+  panel still shows both so any residual gap is visible.
+- **Don't shadow `s0`** — the anchor translation is closed over by `m2s_xy` /
+  `s2m_xy`; reusing the name for a local (e.g. an arc-length scalar) silently
+  breaks the scene↔matcher map. The projection arc-length is `s_proj`.
 - **Shared frame with the kinematic runtime** — occupancy + path are
   sim/runtime-agnostic, so the same `path.npz` drives `run_mujoco.py`,
   `run_mujoco_mm.py`, and `run_isaac.py` alike.
@@ -271,13 +333,14 @@ The `occupancy.npz` / `path.npz` are read straight from the existing
 ## Running it
 
 ```bash
-# opengl (mlspaces-mujoco) — reuses the existing occupancy/path; NON-ceiling scene
+# opengl (mlspaces-mujoco) — reuses the existing occupancy/path; NON-ceiling scene.
+# Default --query-mode is `targets` (path trajectory -> step_targets, tight tracking).
 conda run -n mlspaces-mujoco python scripts/navigation/run_mujoco_mm.py \
     --scene  <…/scenes/<dataset>/val_<N>.xml>            `# NON-ceiling variant` \
     --path   nav_runs/<dataset>/val_<N>/NN__.../path.npz \
     --occupancy nav_runs/<dataset>/val_<N>/occupancy.npz \
     --out-dir   nav_runs_mm/<dataset>/val_<N>/NN__... \
-    [--speed 1.3]
+    [--speed 1.0] [--query-mode velocity]    `# add this to use pure-pursuit instead`
 
 # filament (mlspaces) — better RGB
 conda run -n mlspaces python scripts/navigation/run_mujoco_mm.py \
@@ -286,5 +349,8 @@ conda run -n mlspaces python scripts/navigation/run_mujoco_mm.py \
 ```
 
 Example generated so far: procthor-10k-val `val_2`, room-2 → room-11 (rounded
-~25 m path) → `nav_runs_mm/procthor-10k-val/val_2/01__room-2__to__room-11/`
-(889 frames, 1280×960 H.264; 99 motion segments, ~37× full→minimal compression).
+~25 m path) → `nav_runs_mm/procthor-10k-val/val_2/01__room-2__to__room-11/`. In
+the default `targets` mode at `--speed 1.0` (with the off-path merge blend): 768
+frames, 1280×960 H.264; 65 motion segments; lands 0.07 m from the goal with ≈0.1 m
+mean (≤0.4 m max) path drift. (The older `velocity`-mode pure-pursuit run of the
+same route was 889 frames / 99 segments with looser drift.)

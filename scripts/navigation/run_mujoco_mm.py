@@ -66,7 +66,7 @@ MM_ROOT = Path.home() / "Projects" / "motionmatching-g1"
 G1_MM_XML = MM_ROOT / "assets" / "unitree_g1" / "g1.xml"
 
 STEP_HZ = 30.0  # matcher data + render rate (the matcher is fixed at 30 fps)
-WALK_SPEED = 1.3  # m/s desired travel speed fed to the matcher's velocity springs
+WALK_SPEED = 1.0  # m/s desired travel speed fed to the matcher's velocity springs
 EGO_W, EGO_H = 640, 480
 # Pure-pursuit lookahead distance L = speed * LOOKAHEAD_TIME_S. Tied to the
 # matcher's 1 s trajectory horizon: the lookahead point is the forward
@@ -75,6 +75,12 @@ LOOKAHEAD_TIME_S = 1.0
 ARRIVE_TOL_M = 0.4  # within this of the final waypoint counts as arrived
 SETTLE_FRAMES = 45  # extra frames (desiredVel=0) after arrival so the gait settles
 PATH_STEP_M = 0.1  # densification spacing for the pure-pursuit target path
+# targets mode: when the robot is off the path, its residual lateral offset is added
+# to the sampled centerline targets and decayed linearly to zero over this horizon, so
+# the targets describe a smooth merge back onto the line (over ~CONVERGE_TIME_S worth of
+# travel) instead of demanding an infeasible instant lateral snap. = the far horizon tap
+# (1 s) by default, so the offset is fully closed by the farthest target.
+CONVERGE_TIME_S = 1.0
 
 # Overhead chase camera: deliberately MORE top-down than run_mujoco.py so the
 # full-body gait and the route are both clearly visible. Use a NON-ceiling scene
@@ -123,6 +129,26 @@ def resample_path(waypoints: np.ndarray, step: float) -> np.ndarray:
         for i in range(1, n + 1):
             out.append(a + d * (length * i / n))
     return np.array(out)
+
+
+def path_arclength(planned):
+    """Cumulative arc-length (m) at each densified path point; arclen[0] = 0."""
+    seg = np.linalg.norm(np.diff(planned, axis=0), axis=1)
+    return np.concatenate([[0.0], np.cumsum(seg)])
+
+
+def sample_path_at(planned, arclen, s):
+    """Point + unit tangent on the densified path at arc-length `s` (clamped to
+    the path). Used by the future-targets query mode to read targets *along* the
+    trajectory at fixed arc-lengths ahead of the robot's projection."""
+    s = float(np.clip(s, 0.0, arclen[-1]))
+    j = int(np.clip(np.searchsorted(arclen, s), 1, len(planned) - 1))
+    seg = planned[j] - planned[j - 1]
+    seglen = arclen[j] - arclen[j - 1]
+    frac = (s - arclen[j - 1]) / seglen if seglen > 1e-9 else 0.0
+    pos = planned[j - 1] + seg * frac
+    tan = seg / (np.linalg.norm(seg) or 1.0)
+    return pos, tan
 
 
 def pure_pursuit_target(planned, robot_xy, closest, lookahead):
@@ -467,6 +493,22 @@ def main() -> int:
     ap.add_argument("--mm-root", type=Path, default=MM_ROOT, help="motion-matching repo root")
     ap.add_argument("--speed", type=float, default=WALK_SPEED, help="desired travel speed (m/s)")
     ap.add_argument(
+        "--query-mode",
+        choices=["velocity", "targets"],
+        default="targets",
+        help="how the matcher is driven (default: targets): 'targets' = future "
+        "targets sampled along the path are fed to the matcher's query directly "
+        "(matcher.step_targets); 'velocity' = pure-pursuit desiredVel and the "
+        "matcher's springs predict the future-target query (matcher.step)",
+    )
+    ap.add_argument(
+        "--converge-time",
+        type=float,
+        default=CONVERGE_TIME_S,
+        help="targets mode: horizon (s) over which an off-path lateral offset decays "
+        "to zero (merge-onto-path rate). 0 disables the blend (pure-centerline targets)",
+    )
+    ap.add_argument(
         "--max-frames", type=int, default=0, help="hard frame cap (0 = auto from path length)"
     )
     ap.add_argument(
@@ -493,6 +535,7 @@ def main() -> int:
     path3d = planned[::stride]
     if not np.array_equal(path3d[-1], planned[-1]):
         path3d = np.vstack([path3d, planned[-1]])
+    arclen = path_arclength(planned)  # for the targets-query mode (sample along path)
 
     matcher = load_matcher(args.mm_root)
     # Motion-library index tables for the compact ("minimal") representation:
@@ -548,10 +591,11 @@ def main() -> int:
         max_frames = int(est * 2 + 120)
 
     lookahead = args.speed * LOOKAHEAD_TIME_S  # pure-pursuit circle radius (m)
+    horizon_s = matcher.Ttimes  # [1/3, 2/3, 1] s -- the matcher's future-target taps
     print(
         f"merging Menagerie G1; full-body motion matching @ {STEP_HZ:.0f} Hz, "
-        f"speed {args.speed:.1f} m/s, lookahead {lookahead:.2f} m, "
-        f"path {path_len:.1f} m  [{args.renderer} renderer]"
+        f"speed {args.speed:.1f} m/s, query-mode={args.query_mode}, "
+        f"lookahead {lookahead:.2f} m, path {path_len:.1f} m  [{args.renderer} renderer]"
     )
 
     rgb_frames, depth_frames, follow_frames, combined = [], [], [], []
@@ -560,26 +604,73 @@ def main() -> int:
     nframes = 0
     while nframes < max_frames:
         nframes += 1
-        # --- pure-pursuit steering toward a lookahead point on the planned path
         robot_s = m2s_xy(matcher.rootPos[:2])
         closest = int(np.argmin(np.linalg.norm(planned - robot_s, axis=1)))
         arrived = (
             closest >= len(planned) - 2 and np.linalg.norm(planned[-1] - robot_s) < ARRIVE_TOL_M
         )
         if arrived:
-            target_s = planned[-1]
-            desired_vel_s = np.zeros(2)  # stop -> matcher settles to idle
-            desired_vel_m = np.zeros(3)
             settle += 1
-        else:
-            target_s, _ = pure_pursuit_target(planned, robot_s, closest, lookahead)
-            dir_s = target_s - robot_s
-            nrm = np.linalg.norm(dir_s)
-            unit_s = dir_s / nrm if nrm > 1e-6 else np.zeros(2)
-            desired_vel_s = unit_s * args.speed  # command, scene frame (for viz/log)
-            desired_vel_m = np.array([*(Rinv @ unit_s), 0.0]) * args.speed  # matcher frame
 
-        qm = matcher.step(desired_vel_m, [0.0, 0.0, 0.0])  # face = follow velocity
+        if args.query_mode == "targets":
+            # --- Future-targets query: sample the path at fixed arc-lengths
+            # AHEAD OF THE ROBOT'S PROJECTION (speed * [1/3, 2/3, 1] s), then add the
+            # robot's residual lateral offset decayed to zero across the horizon so the
+            # targets describe a smooth MERGE back onto the line. Sampling ahead of the
+            # projection (arclen[closest]) -- not the robot itself -- keeps the targets
+            # on the path ahead; the decaying-offset blend below makes the near targets
+            # sit on the diagonal approach toward the line rather than demanding an
+            # instant (infeasible) lateral snap when the robot has drifted off.
+            z0 = float(matcher.rootPos[2])
+            if arrived:
+                pts = [planned[-1]] * len(horizon_s)
+                tans = [planned[-1] - planned[-2]] * len(horizon_s)
+                desired_vel_s = np.zeros(2)
+            else:
+                # arc-length of the robot's projection; sample targets ahead of it.
+                # NB: must NOT be named `s0` -- that is the anchor translation closed
+                # over by m2s_xy/s2m_xy; shadowing it corrupts the scene<->matcher map.
+                s_proj = arclen[closest]
+                err = robot_s - planned[closest]  # cross-track offset: projection -> robot
+                base = [sample_path_at(planned, arclen, s_proj + args.speed * t) for t in horizon_s]
+                # Add the residual offset, weight w: 1 (near) -> 0 (far over CONVERGE_TIME_S),
+                # and derive each facing from the resulting approach chain (robot -> targets)
+                # so the heading curves diagonally in and straightens onto the path.
+                conv = args.converge_time
+                pts, tans = [], []
+                prev = robot_s
+                for (b, ptan), t in zip(base, horizon_s):
+                    if conv > 0:  # decaying-offset merge blend
+                        p = b + err * max(0.0, 1.0 - t / conv)
+                        step = p - prev
+                        tans.append(step if np.linalg.norm(step) > 1e-6 else ptan)
+                    else:  # blend disabled: pure-centerline targets + path tangents
+                        p = b
+                        tans.append(ptan)
+                    pts.append(p)
+                    prev = p
+                fd = pts[0] - robot_s
+                nrm = np.linalg.norm(fd)
+                desired_vel_s = fd / nrm * args.speed if nrm > 1e-6 else np.zeros(2)
+            target_s = pts[-1]  # the 1 s-horizon target (green sphere)
+            tpos_m = np.array([[*s2m_xy(p), z0] for p in pts])
+            tdir_m = np.array([[*(Rinv @ (t / (np.linalg.norm(t) or 1.0))), 0.0] for t in tans])
+            qm = matcher.step_targets(tpos_m, tdir_m)
+        else:
+            # --- Velocity query: pure-pursuit lookahead -> desiredVel; the
+            # matcher's springs predict the future-target query from it.
+            if arrived:
+                target_s = planned[-1]
+                desired_vel_s = np.zeros(2)  # stop -> matcher settles to idle
+                desired_vel_m = np.zeros(3)
+            else:
+                target_s, _ = pure_pursuit_target(planned, robot_s, closest, lookahead)
+                dir_s = target_s - robot_s
+                nrm = np.linalg.norm(dir_s)
+                unit_s = dir_s / nrm if nrm > 1e-6 else np.zeros(2)
+                desired_vel_s = unit_s * args.speed  # command, scene frame (viz/log)
+                desired_vel_m = np.array([*(Rinv @ unit_s), 0.0]) * args.speed  # matcher frame
+            qm = matcher.step(desired_vel_m, [0.0, 0.0, 0.0])  # face = follow velocity
 
         # --- map matcher-frame pose into the scene frame, set the FULL qpos
         scene_xy = m2s_xy(qm[0:2])
@@ -587,7 +678,13 @@ def main() -> int:
         qscene[0:2] = scene_xy
         qscene[3:7] = quat_mul(dquat, qm[3:7])
         data.qpos[base_adr : base_adr + 36] = qscene
-        mujoco.mj_forward(model, data)
+        # Position-only pipeline (FK + camera/light placement), NOT mj_forward:
+        # we place the robot kinematically and only render, so we never want the
+        # collision/constraint solver -- and a transient wall penetration would
+        # otherwise make it fail with "FactorizeHessian: rank-deficient ...".
+        mujoco.mj_kinematics(model, data)
+        mujoco.mj_comPos(model, data)
+        mujoco.mj_camlight(model, data)
 
         qpos_log.append(qscene.astype(np.float32))
         idx_log.append(int(matcher.animFrame))  # which DB frame produced this pose
@@ -658,7 +755,12 @@ def main() -> int:
         cv2.line(mp, dot, head, (40, 40, 40), 3, cv2.LINE_AA)
         cv2.circle(mp, dot, 8, (0, 0, 230), -1, cv2.LINE_AA)
 
-        top = np.hstack([label(mp, "Top-down map"), label(follow, "Chase: target + MM command")])
+        top = np.hstack(
+            [
+                label(mp, "Top-down map"),
+                label(follow, f"Chase ({args.query_mode}): target + command"),
+            ]
+        )
         bot = np.hstack([label(rgb, "Ego RGB"), label(depth, "Ego depth")])
         combined.append(np.vstack([top, bot]))
 
