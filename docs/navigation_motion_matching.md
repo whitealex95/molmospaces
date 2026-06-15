@@ -85,11 +85,18 @@ robot reproduces the path *shape* in the scene frame.
 Each frame the script:
 
 1. Densifies the planned path to `PATH_STEP_M` (0.1 m) spacing.
-2. Finds the closest densified point to the robot's current scene position, then
-   targets a **lookahead point** `PURSUIT_LOOKAHEAD_M` (0.8 m) further along.
-3. Sets `desiredVel` toward that target (in the matcher frame via `T⁻¹`), scaled
-   to `--speed` (default `WALK_SPEED` = 1.3 m/s). `desiredFace` is left zero so
-   the robot faces its travel direction.
+2. Finds the **lookahead point** by the classic pure-pursuit rule
+   (`pure_pursuit_target`): the forward intersection of the circle of radius
+   `L = --speed × LOOKAHEAD_TIME_S` (default 1.0 s, so ≈1.3 m at 1.3 m/s — tied
+   to the matcher's 1 s trajectory horizon) about the robot with the planned
+   path. Scanning forward from the closest path point, it is the first point at
+   distance ≥ L. If the robot has drifted >L off the path it targets the nearest
+   path point (steer back on); near the goal it targets the final waypoint.
+3. Sets `desiredVel` toward that lookahead (in the matcher frame via `T⁻¹`),
+   scaled to `--speed`. `desiredFace` is left zero so the robot faces its travel
+   direction. The matcher's springs turn this velocity into the actual
+   future-target query — the robot is never driven *to* the lookahead point;
+   it only sets the instantaneous desired heading.
 
 **Drift is expected and realistic** — motion matching does not track the line
 exactly. The top-down panel therefore draws **both** the planned path (orange
@@ -239,7 +246,7 @@ The `occupancy.npz` / `path.npz` are read straight from the existing
 | Constant | Default | Effect |
 |---|---|---|
 | `--speed` / `WALK_SPEED` | 1.3 | desired travel speed fed to the matcher's velocity springs (m/s) |
-| `PURSUIT_LOOKAHEAD_M` | 0.8 | pure-pursuit lookahead along the densified path |
+| `LOOKAHEAD_TIME_S` | 1.0 | pure-pursuit lookahead time; circle radius L = `--speed` × this |
 | `PATH_STEP_M` | 0.1 | densification spacing for the pursuit target |
 | `ARRIVE_TOL_M` | 0.4 | radius around the final waypoint counting as arrived |
 | `SETTLE_FRAMES` | 45 | extra frames (`desiredVel`=0) after arrival so the gait settles |

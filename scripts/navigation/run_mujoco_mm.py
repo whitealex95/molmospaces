@@ -68,7 +68,10 @@ G1_MM_XML = MM_ROOT / "assets" / "unitree_g1" / "g1.xml"
 STEP_HZ = 30.0  # matcher data + render rate (the matcher is fixed at 30 fps)
 WALK_SPEED = 1.3  # m/s desired travel speed fed to the matcher's velocity springs
 EGO_W, EGO_H = 640, 480
-PURSUIT_LOOKAHEAD_M = 0.8  # pure-pursuit lookahead along the densified path
+# Pure-pursuit lookahead distance L = speed * LOOKAHEAD_TIME_S. Tied to the
+# matcher's 1 s trajectory horizon: the lookahead point is the forward
+# intersection of the circle of radius L about the robot with the planned path.
+LOOKAHEAD_TIME_S = 1.0
 ARRIVE_TOL_M = 0.4  # within this of the final waypoint counts as arrived
 SETTLE_FRAMES = 45  # extra frames (desiredVel=0) after arrival so the gait settles
 PATH_STEP_M = 0.1  # densification spacing for the pure-pursuit target path
@@ -120,6 +123,27 @@ def resample_path(waypoints: np.ndarray, step: float) -> np.ndarray:
         for i in range(1, n + 1):
             out.append(a + d * (length * i / n))
     return np.array(out)
+
+
+def pure_pursuit_target(planned, robot_xy, closest, lookahead):
+    """Classic pure-pursuit lookahead: the forward intersection of the circle of
+    radius `lookahead` about the robot with the planned path.
+
+    Scans the path from the robot's closest point forward and returns the first
+    point that lies on/just past the circle (distance >= lookahead) -- a point
+    ~`lookahead` away in the travel direction, so steering anticipates the path
+    `lookahead` metres ahead. If the rest of the path is all within the circle,
+    returns the final waypoint; if the robot has drifted >`lookahead` from the
+    path, returns the nearest path point so it steers back on. Returns
+    (target_xy, index)."""
+    n = len(planned)
+    if np.linalg.norm(planned[closest] - robot_xy) >= lookahead:
+        return planned[closest], closest  # drifted far off -> head back to path
+    j = closest
+    while j < n and np.linalg.norm(planned[j] - robot_xy) < lookahead:
+        j += 1
+    j = min(j, n - 1)
+    return planned[j], j
 
 
 # --- In-scene debug geometry -------------------------------------------------
@@ -523,10 +547,11 @@ def main() -> int:
         est = path_len / max(0.3, 0.7 * args.speed) * STEP_HZ
         max_frames = int(est * 2 + 120)
 
-    lookahead_steps = max(1, int(round(PURSUIT_LOOKAHEAD_M / PATH_STEP_M)))
+    lookahead = args.speed * LOOKAHEAD_TIME_S  # pure-pursuit circle radius (m)
     print(
         f"merging Menagerie G1; full-body motion matching @ {STEP_HZ:.0f} Hz, "
-        f"speed {args.speed:.1f} m/s, path {path_len:.1f} m  [{args.renderer} renderer]"
+        f"speed {args.speed:.1f} m/s, lookahead {lookahead:.2f} m, "
+        f"path {path_len:.1f} m  [{args.renderer} renderer]"
     )
 
     rgb_frames, depth_frames, follow_frames, combined = [], [], [], []
@@ -547,7 +572,7 @@ def main() -> int:
             desired_vel_m = np.zeros(3)
             settle += 1
         else:
-            target_s = planned[min(closest + lookahead_steps, len(planned) - 1)]
+            target_s, _ = pure_pursuit_target(planned, robot_s, closest, lookahead)
             dir_s = target_s - robot_s
             nrm = np.linalg.norm(dir_s)
             unit_s = dir_s / nrm if nrm > 1e-6 else np.zeros(2)
