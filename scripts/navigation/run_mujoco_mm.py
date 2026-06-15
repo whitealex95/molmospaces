@@ -215,10 +215,16 @@ def _decor_connector(scene, gtype, width, frm, to, rgba):
     scene.ngeom += 1
 
 
-def build_model(scene_xml: Path, g1_xml: Path, backend: str = "opengl"):
+def build_model(scene_xml: Path, g1_xml: Path, backend: str = "opengl", obstacle=None):
     """Merge the Menagerie G1 into the scene MJCF; add a head-mounted 'ego'
     camera (identical placement to run_mujoco.py). For Filament also mount a
-    forward fill light on the torso (Filament ignores the MuJoCo headlight)."""
+    forward fill light on the torso (Filament ignores the MuJoCo headlight).
+
+    obstacle: optional (x, y, sx, sy, sz[, yaw_deg]) box (center xy, full sizes, m,
+    optional yaw about +z) added as a static red geom resting on the z=0 floor -- the
+    thing the robot jumps over (jump variant) or the A* detour routes around. Purely
+    visual: the runtime is kinematic (no collision), so it never physically blocks the
+    robot."""
     scene = mujoco.MjSpec.from_file(str(scene_xml))
     g1 = mujoco.MjSpec.from_file(str(g1_xml))
 
@@ -249,6 +255,17 @@ def build_model(scene_xml: Path, g1_xml: Path, backend: str = "opengl"):
         lamp.diffuse = [2.5, 2.5, 2.5]
         lamp.specular = [0.1, 0.1, 0.1]
         lamp.castshadow = 0
+
+    if obstacle is not None:
+        ox, oy, sx, sy, sz = obstacle[:5]
+        yaw = np.radians(obstacle[5]) if len(obstacle) > 5 else 0.0
+        box = scene.worldbody.add_geom()
+        box.name = "nav_obstacle"
+        box.type = mujoco.mjtGeom.mjGEOM_BOX
+        box.size = [sx / 2, sy / 2, sz / 2]
+        box.pos = [ox, oy, sz / 2]  # rest on the z=0 floor
+        box.quat = yaw_quat(yaw)  # align with the path so it stays jumpably shallow
+        box.rgba = [0.85, 0.18, 0.18, 1.0]
 
     return scene.compile()
 
@@ -287,11 +304,11 @@ def make_renderer(model, height: int, width: int, backend: str):
     return render
 
 
-def build_map_panel(occ_path: Path, planned: np.ndarray, pw: int, ph: int):
-    """Static 2D top-down panel (rooms tinted, PLANNED path drawn).
-    Returns the panel image and a world->panel-pixel function. The robot's
-    ACTUAL position is drawn per frame by the caller (motion matching drifts
-    off the planned line)."""
+def build_map_panel(occ_path: Path, planned: np.ndarray, pw: int, ph: int, obstacle=None):
+    """Static 2D top-down panel (rooms tinted, PLANNED path drawn, plus the
+    obstacle box footprint if given). Returns the panel image and a
+    world->panel-pixel function. The robot's ACTUAL position is drawn per frame
+    by the caller (motion matching drifts off the planned line)."""
     o = np.load(occ_path, allow_pickle=True)
     occupancy = o["occupancy"]
     room_map = o["room_map"]
@@ -321,6 +338,22 @@ def build_map_panel(occ_path: Path, planned: np.ndarray, pw: int, ph: int):
         5,
         cv2.LINE_AA,
     )
+
+    # Obstacle footprint (the box the jump leaps / the detour routes around): a filled
+    # red rectangle (matching the in-scene box). obstacle is (x,y,sx,sy,sz[,yaw_deg]) --
+    # index 4 is the height sz, the optional yaw is index 5.
+    if obstacle is not None:
+        ox_, oy_, sx, sy = obstacle[:4]
+        yaw = np.radians(obstacle[5]) if len(obstacle) > 5 else 0.0
+        cs, sn = np.cos(yaw), np.sin(yaw)
+        corners_w = [
+            (ox_ + cs * dx - sn * dy, oy_ + sn * dx + cs * dy)
+            for dx, dy in ((-sx / 2, -sy / 2), (sx / 2, -sy / 2), (sx / 2, sy / 2), (-sx / 2, sy / 2))
+        ]
+        poly = np.array(
+            [(w2m @ np.array([x, y, 0.0, 1.0]))[::-1] for x, y in corners_w], np.int32
+        )  # (col, row) for cv2
+        cv2.fillConvexPoly(img, poly, (46, 46, 217))  # BGR ~ the box's red rgba
 
     h, w = img.shape[:2]
     s = min(pw / w, ph / h)
@@ -509,6 +542,26 @@ def main() -> int:
         "to zero (merge-onto-path rate). 0 disables the blend (pure-centerline targets)",
     )
     ap.add_argument(
+        "--obstacle",
+        type=str,
+        default=None,
+        help="place a box obstacle 'x,y,sx,sy,sz' (center xy, full sizes m) on the floor; "
+        "rendered in all cameras. Used by the jump variant (leap over) and the detour "
+        "variant (A* routes around it). Visual only -- the kinematic runtime has no collision",
+    )
+    ap.add_argument(
+        "--jump",
+        action="store_true",
+        help="trigger the matcher's jump skill to leap the --obstacle (a fixed scripted "
+        "leap; fire it on a straight, clear segment so the arc clears the box and lands free)",
+    )
+    ap.add_argument(
+        "--jump-lead",
+        type=float,
+        default=1.5,
+        help="run-up lead distance (m) before the obstacle at which the jump is triggered",
+    )
+    ap.add_argument(
         "--max-frames", type=int, default=0, help="hard frame cap (0 = auto from path length)"
     )
     ap.add_argument(
@@ -523,6 +576,14 @@ def main() -> int:
     out_dir = (args.out_dir or args.path.parent / "nav_run_mm").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    obstacle = None
+    if args.obstacle:
+        obstacle = tuple(float(v) for v in args.obstacle.split(","))
+        if len(obstacle) not in (5, 6):
+            raise SystemExit("--obstacle must be 'x,y,sx,sy,sz' or 'x,y,sx,sy,sz,yaw_deg'")
+    if args.jump and obstacle is None:
+        raise SystemExit("--jump needs --obstacle (the box to leap over)")
+
     p = np.load(args.path, allow_pickle=True)
     waypoints = p["waypoints"].astype(float)
     print(f"path: {p['start_room']} -> {p['goal_room']}  ({len(waypoints)} waypoints)")
@@ -536,6 +597,15 @@ def main() -> int:
     if not np.array_equal(path3d[-1], planned[-1]):
         path3d = np.vstack([path3d, planned[-1]])
     arclen = path_arclength(planned)  # for the targets-query mode (sample along path)
+
+    # Jump trigger point: arc-length where the obstacle sits on the path, minus the
+    # run-up lead. The jump is fired once when the robot's projection passes this -- on
+    # the straight, clear segment the obstacle was placed on, so the leap clears it.
+    jump_arclen = None
+    if args.jump:
+        obs_xy = np.array(obstacle[:2])
+        obs_idx = int(np.argmin(np.linalg.norm(planned - obs_xy, axis=1)))
+        jump_arclen = max(0.0, arclen[obs_idx] - args.jump_lead)
 
     matcher = load_matcher(args.mm_root)
     # Motion-library index tables for the compact ("minimal") representation:
@@ -571,7 +641,7 @@ def main() -> int:
     def s2m_xy(p_s):  # scene xy -> matcher xy
         return Rinv @ (np.asarray(p_s) - s0) + m0
 
-    model = build_model(args.scene, args.g1, args.renderer)
+    model = build_model(args.scene, args.g1, args.renderer, obstacle=obstacle)
     data = mujoco.MjData(model)
     base_adr = model.joint("g1_floating_base_joint").qposadr[0]
 
@@ -581,7 +651,7 @@ def main() -> int:
     followcam.distance = CHASE_DIST
     followcam.elevation = CHASE_ELEV
 
-    map_base, world_to_panel = build_map_panel(occ_path, planned, EGO_W, EGO_H)
+    map_base, world_to_panel = build_map_panel(occ_path, planned, EGO_W, EGO_H, obstacle=obstacle)
 
     if args.max_frames > 0:
         max_frames = args.max_frames
@@ -602,6 +672,7 @@ def main() -> int:
     qpos_log, idx_log, cmd_log = [], [], []  # full pose, DB index, command velocity (scene)
     settle = 0
     nframes = 0
+    jump_fired = False
     while nframes < max_frames:
         nframes += 1
         robot_s = m2s_xy(matcher.rootPos[:2])
@@ -611,6 +682,16 @@ def main() -> int:
         )
         if arrived:
             settle += 1
+
+        # Jump trigger: once the robot's projection reaches the run-up point before the
+        # obstacle, request the leap. The matcher enters it on the next step (step_targets
+        # honours the trigger); while airborne it rides the jump clip and ignores targets,
+        # then the merge blend pulls the post-landing drift back onto the path.
+        if jump_arclen is not None and not jump_fired and arclen[closest] >= jump_arclen:
+            matcher.trigger_jump()
+            jump_fired = True
+            print(f"  jump triggered at arclen {arclen[closest]:.1f} m "
+                  f"(obstacle ~{arclen[closest] + args.jump_lead:.1f} m)")
 
         if args.query_mode == "targets":
             # --- Future-targets query: sample the path at fixed arc-lengths

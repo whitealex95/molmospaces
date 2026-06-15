@@ -161,6 +161,15 @@ room; `--start-room` / `--goal-room` override by name substring. `--resmooth
 <path.npz>` re-rounds an *existing* path in place (using its `waypoints_raw`),
 e.g. to re-round paths planned before smoothing was added or with a new window.
 
+**Extra obstacle (`--obstacle`)** — `'x,y,sx,sy[,yaw_deg]'` stamps a (optionally
+yaw-rotated) world rectangle (center xy, full sizes m) as occupied *before* the
+clearance dilation, so A* must detour around it. Used to produce the navigation
+"detour" variant: the same box the motion-matching jump variant leaps over
+(`run_mujoco_mm.py --obstacle`) is stamped here so A* routes around it instead.
+Align `yaw` with the local path heading and keep `sx` (depth along the path)
+small so the box stays jumpable while `sy` (width across the path) blocks the
+corridor. `Planner(..., obstacle=(x,y,sx,sy[,yaw_deg]))` exposes the same.
+
 ## Stage 3 — `run_mujoco.py`
 
 Scene + `path.npz` → the egocentric/chase video.

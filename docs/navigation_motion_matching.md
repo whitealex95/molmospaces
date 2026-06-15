@@ -158,6 +158,31 @@ exactly. Either way the top-down panel draws **both** the planned path (orange
 polyline) and the robot's *actual* position (red dot), so any gap is visible
 rather than hidden.
 
+### Obstacle + jump / detour variants
+
+A box obstacle can be dropped on the route, giving two ways past it that share the
+same start/goal:
+
+- **`--obstacle 'x,y,sx,sy,sz[,yaw_deg]'`** — adds a static red box (center xy, full
+  sizes m, optional yaw about +z) resting on the floor, rendered in **all** cameras
+  (`build_model`). It is **visual only** — the runtime is kinematic, so it never
+  physically blocks the robot. Align `yaw` with the local path heading and keep `sx`
+  (depth along the path) small so it stays jumpable, while `sy` (width across the
+  path) is what a detour must go around.
+- **Jump over it** (`--jump`, needs `--obstacle`): the matcher's scripted jump skill
+  is fired via `matcher.trigger_jump()` once the robot's projection reaches
+  `obstacle_arclen − --jump-lead` (default 1.5 m run-up). The jump is a **fixed
+  forward leap** (~0.3 m rise, can't steer mid-air), so the trigger is deliberately
+  **local-geometry-based** — fire it on a straight, clear segment so the arc clears
+  the box and lands in free space. ("Long way to go" is *not* a good trigger; the
+  jump distance is fixed.) `step_targets` honours the trigger (shared
+  `_maybe_enter_jump` in the controller); while airborne the matcher rides the jump
+  clip and ignores the targets, then the merge blend (§2a) pulls the post-landing
+  drift back onto the path.
+- **Detour around it**: stamp the *same* box into the occupancy grid and re-plan with
+  `plan.py --obstacle 'x,y,sx,sy[,yaw_deg]'` → a `path.npz` that routes around it;
+  render that path with `--obstacle` (no `--jump`). See `docs/navigation_pipeline.md`.
+
 ### Control overlay — drawn in-scene, in the overhead chase
 
 The target path and the motion-matching command are drawn as **real 3D geometry
@@ -179,8 +204,9 @@ the Filament renderer both rasterize the `MjvScene` via `mjr_render`.
   taps), mapped from the matcher frame into the scene. This is what the search
   query is built against, so it shows where the controller "thinks" it is headed.
 
-The 2D **top-down map** panel (top-left) keeps just the baked planned path plus
-the robot's actual pelvis position + heading marker. Colours of the in-scene
+The 2D **top-down map** panel (top-left) keeps the baked planned path, the
+robot's actual pelvis position + heading marker, and — if `--obstacle` is set —
+the box's red footprint (`build_map_panel`). Colours of the in-scene
 geoms are set in `run_mujoco_mm.py` (`PATH_RGBA` / `TARGET_RGBA` / `CMD_RGBA` /
 `TPOS_RGBA`, RGBA 0–1); heights via `PATH_Z` / `TPOS_Z` / `TARGET_Z` / `CMD_Z`.
 
@@ -252,6 +278,10 @@ nav_runs_mm/<dataset>/<scene>/NN__<start>__to__<goal>/
   motion_full.npz  motion_min.npz                       # saved motion (below)
 ```
 
+When one route has several variants (e.g. straight vs jump vs detour), give each
+its own `--out-dir` *subfolder* under the route folder so they sit together, e.g.
+`NN__<start>__to__<goal>/{vanilla,jump,detour}/` (see the example below).
+
 ## Saved motion: full sequence vs minimal control stream
 
 Each run also saves the produced motion in **two** representations so you can
@@ -305,6 +335,9 @@ The `occupancy.npz` / `path.npz` are read straight from the existing
 | `LOOKAHEAD_TIME_S` | 1.0 | pure-pursuit lookahead time (velocity mode only); circle radius L = `--speed` × this |
 | `PATH_STEP_M` | 0.1 | densification spacing for the target/pursuit path |
 | `CONVERGE_TIME_S` | 1.0 | targets mode: horizon over which an off-path lateral offset decays to zero (merge-onto-path rate); larger ⇒ gentler/more feasible cut-in |
+| `--obstacle` | _(none)_ | `x,y,sx,sy,sz[,yaw_deg]` box on the floor (jump over / detour around); visual only |
+| `--jump` | off | trigger the scripted jump to leap the `--obstacle` (needs `--obstacle`) |
+| `--jump-lead` | 1.5 | run-up lead distance (m) before the obstacle at which the jump fires |
 | `ARRIVE_TOL_M` | 0.4 | radius around the final waypoint counting as arrived |
 | `SETTLE_FRAMES` | 45 | extra frames (`desiredVel`=0) after arrival so the gait settles |
 | `--max-frames` | auto | hard frame cap (0 ⇒ path-length × 2 + 120) |
@@ -348,9 +381,16 @@ conda run -n mlspaces python scripts/navigation/run_mujoco_mm.py \
     --occupancy <…/occupancy.npz> --out-dir <nav_runs_mm/…> --renderer filament
 ```
 
-Example generated so far: procthor-10k-val `val_2`, room-2 → room-11 (rounded
-~25 m path) → `nav_runs_mm/procthor-10k-val/val_2/01__room-2__to__room-11/`. In
-the default `targets` mode at `--speed 1.0` (with the off-path merge blend): 768
-frames, 1280×960 H.264; 65 motion segments; lands 0.07 m from the goal with ≈0.1 m
-mean (≤0.4 m max) path drift. (The older `velocity`-mode pure-pursuit run of the
-same route was 889 frames / 99 segments with looser drift.)
+Examples generated so far — procthor-10k-val `val_2`, room-2 → room-11 (~25 m),
+default `targets` mode at `--speed 1.0`, three variants of the one task under a
+shared run folder `nav_runs_mm/procthor-10k-val/val_2/01__room-2__to__room-11/`:
+
+| Variant | Subdir | Notes |
+|---|---|---|
+| 1. straight (vanilla) | `vanilla/` | no obstacle; 768 frames; lands 0.07 m from goal, ≈0.1 m mean (≤0.4 m max) drift |
+| 2. jump over box | `jump/` | `--obstacle 10.4,7.6,0.6,2.4,0.25,-118 --jump`; jump fires at 15.2 m, leaps the 0.25 m box (pelvis 0.78→1.01 m), 723 frames / 1 jump segment |
+| 3. detour around box | `detour/` | same box stamped via `plan.py --obstacle 10.4,7.6,0.6,2.4,-118`; A* swings ~1.8 m around it, 659 frames |
+
+The obstacle box is drawn both in the 3D scene (chase + ego views) **and** as a
+filled red footprint on the top-down map panel. (The older `velocity`-mode
+pure-pursuit run of variant 1 was 889 frames / 99 segments with looser drift.)

@@ -69,7 +69,13 @@ class Planner:
     coarse-cell pairs. Shared by this script's CLI and gen_trajectories.py.
     """
 
-    def __init__(self, occupancy_npz, agent_radius: float = 0.2, smooth_strength: float = 0.5):
+    def __init__(
+        self,
+        occupancy_npz,
+        agent_radius: float = 0.2,
+        smooth_strength: float = 0.5,
+        obstacle=None,
+    ):
         o = np.load(occupancy_npz, allow_pickle=True)
         self.occ = o["occupancy"]  # bool, True = free
         self.room_map = o["room_map"]
@@ -79,6 +85,26 @@ class Planner:
         self.px_per_m = float(o["px_per_m"])
         self.agent_radius = agent_radius
         self.smooth_strength = smooth_strength  # path-rounding window (m); 0 disables
+
+        # Optional extra obstacle (x, y, sx, sy[, yaw_deg]): mark a (optionally rotated)
+        # world rectangle -- center xy, full sizes m, yaw about +z -- as occupied before
+        # clearance dilation, so A* must route around it. Aligning yaw with the local path
+        # heading lets the box be shallow along the path (jumpable) yet wide across it.
+        if obstacle is not None:
+            ox, oy, sx, sy = obstacle[:4]
+            yaw = np.radians(obstacle[4]) if len(obstacle) > 4 else 0.0
+            self.occ = self.occ.copy()
+            cs, sn = np.cos(yaw), np.sin(yaw)
+            corners_w = [
+                (ox + cs * dx - sn * dy, oy + sn * dx + cs * dy)
+                for dx, dy in ((-sx / 2, -sy / 2), (sx / 2, -sy / 2), (sx / 2, sy / 2), (-sx / 2, sy / 2))
+            ]
+            poly = np.array(
+                [world_to_px(self.world_to_map, x, y)[::-1] for x, y in corners_w], np.int32
+            )  # (col, row) for cv2
+            mask = np.zeros(self.occ.shape, np.uint8)
+            cv2.fillConvexPoly(mask, poly, 1)
+            self.occ[mask == 1] = False
 
         # agent-radius clearance, then downscale (min-pool: a coarse cell is
         # free only if every fine cell is free).
@@ -240,6 +266,14 @@ def main() -> int:
         help="path-rounding window in metres (0 = rigid grid A* path)",
     )
     ap.add_argument(
+        "--obstacle",
+        type=str,
+        default=None,
+        help="extra blocking box 'x,y,sx,sy[,yaw_deg]' (center xy, full sizes m, optional "
+        "yaw about +z) stamped occupied before planning, so A* detours around it (e.g. the "
+        "box the MM jump variant leaps; align yaw with the path so it stays jumpably shallow)",
+    )
+    ap.add_argument(
         "--resmooth",
         type=Path,
         default=None,
@@ -247,7 +281,14 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    planner = Planner(args.occupancy, args.agent_radius, smooth_strength=args.smooth)
+    obstacle = None
+    if args.obstacle:
+        obstacle = tuple(float(v) for v in args.obstacle.split(","))
+        if len(obstacle) not in (4, 5):
+            raise SystemExit("--obstacle must be 'x,y,sx,sy' or 'x,y,sx,sy,yaw_deg'")
+    planner = Planner(
+        args.occupancy, args.agent_radius, smooth_strength=args.smooth, obstacle=obstacle
+    )
     print(f"A* graph: {planner.graph.number_of_nodes()} navigable nodes")
 
     if args.resmooth is not None:
