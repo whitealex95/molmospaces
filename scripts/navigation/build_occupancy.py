@@ -42,6 +42,7 @@ from molmo_spaces.utils.scene_maps import _get_renderer
 
 MANSION_EXPORT_ROOT = Path.home() / "Projects" / "mansion" / "mjcf_export"
 WALL_THICKNESS_M = 0.12  # nominal thickness used when burning walls into the grid
+DOOR_LEAF_THICKNESS_M = 0.1  # thickness used when burning an OPEN door leaf as obstacle
 DOOR_CARVE_M = 0.6  # opening carved back through a wall at each door geom
 
 
@@ -72,7 +73,19 @@ def clean_room_name(name: str) -> str:
 
 
 def classify_geoms(model):
-    floors, walls, doors = [], [], []
+    """Split geoms into floors / walls / door-openings / door-leaves.
+
+    A door geom is a movable *leaf* (the swinging panel, default open ~90 deg in
+    procthor) when its body carries a hinge joint; the rest of the door geoms are
+    the static *opening* structure (frame + threshold + lintel). The opening is
+    carved free so A* can pass; the open leaf is burned as an obstacle so the path
+    routes around the swung panel instead of clipping through it."""
+    hinge_bodies = {
+        int(model.jnt_bodyid[j])
+        for j in range(model.njnt)
+        if model.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE
+    }
+    floors, walls, door_openings, door_leaves = [], [], [], []
     for g in range(model.ngeom):
         n = geom_name(model, g)
         if not n:
@@ -81,10 +94,10 @@ def classify_geoms(model):
         if is_floor(n) and model.geom(g).contype == 0:
             floors.append(g)
         elif "door" in nl:
-            doors.append(g)
+            (door_leaves if int(model.geom_bodyid[g]) in hinge_bodies else door_openings).append(g)
         elif "wall" in nl:
             walls.append(g)
-    return floors, walls, doors
+    return floors, walls, door_openings, door_leaves
 
 
 def geom_world_verts(model, data, gid):
@@ -152,12 +165,12 @@ def render_topdown(model, data, floor_ids, px_per_m, device_id):
     return seg, world_to_map, map_to_world, px
 
 
-def burn_walls(obstacle, model, data, wall_ids, world_to_map, px_per_m):
-    """Rasterize wall geometry into ``obstacle`` (uint8, 1 = obstacle).
+def burn_walls(obstacle, model, data, wall_ids, world_to_map, px_per_m, thickness_m=WALL_THICKNESS_M):
+    """Rasterize vertical-panel geometry into ``obstacle`` (uint8, 1 = obstacle).
 
-    Walls are vertical panels: project each to the floor plane, take the
-    principal-axis segment, and draw it as a thick line."""
-    thick = max(3, int(round(WALL_THICKNESS_M * px_per_m)))
+    Walls (and open door leaves) are vertical panels: project each to the floor
+    plane, take the principal-axis segment, and draw it as a thick line."""
+    thick = max(3, int(round(thickness_m * px_per_m)))
     for g in wall_ids:
         xy = geom_world_verts(model, data, g)[:, :2]
         if len(xy) < 2:
@@ -218,25 +231,35 @@ def carve_doors(obstacle, model, data, door_ids, world_to_map, px_per_m):
         )
 
 
-def build(model_path: Path, px_per_m: int, device_id):
+def build(model_path: Path, px_per_m: int, device_id, door_leaf_obstacles: bool = True):
     spec = mujoco.MjSpec.from_file(str(model_path))
     model = spec.compile()
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
 
-    floors, walls, doors = classify_geoms(model)
+    floors, walls, door_openings, door_leaves = classify_geoms(model)
     if not floors:
         raise RuntimeError("No floor geoms found (visual geoms named floor_* / room|*)")
 
     seg, world_to_map, map_to_world, px = render_topdown(model, data, floors, px_per_m, device_id)
 
-    # obstacle: 1 where the pixel is not a floor geom; burn walls in, then carve
-    # doorways back open (they are passable but read as obstacle top-down).
+    # obstacle: 1 where the pixel is not a floor geom; burn walls in, then handle doors.
     obstacle = np.ones(seg.shape, np.uint8)
     for fid in floors:
         obstacle[seg == fid] = 0
     burn_walls(obstacle, model, data, walls, world_to_map, px)
-    carve_doors(obstacle, model, data, doors, world_to_map, px)
+    if door_leaf_obstacles:
+        # Carve the door OPENINGS free (they read as obstacle top-down but are passable),
+        # then burn the OPEN door leaves in as obstacles. The leaf burn must come AFTER the
+        # opening carve: the carve is a 0.6 m-wide free swath along the doorway that would
+        # otherwise erase the part of the swung leaf nearest the hinge, leaving only a stub.
+        # Burning last keeps the full leaf footprint so the path routes around the panel.
+        carve_doors(obstacle, model, data, door_openings, world_to_map, px)
+        burn_walls(obstacle, model, data, door_leaves, world_to_map, px, thickness_m=DOOR_LEAF_THICKNESS_M)
+    else:
+        # Legacy behaviour: treat every door (opening + leaf) as a passable carved opening,
+        # so a swung leaf is not an obstacle (the kinematic runtime then clips through it).
+        carve_doors(obstacle, model, data, door_openings + door_leaves, world_to_map, px)
 
     occupancy = obstacle == 0  # True = free / navigable
 
@@ -256,7 +279,8 @@ def build(model_path: Path, px_per_m: int, device_id):
         "map_to_world": map_to_world,
         "px_per_m": float(px),
         "n_walls": len(walls),
-        "n_doors": len(doors),
+        "n_doors": len(door_openings),
+        "n_door_leaves": len(door_leaves) if door_leaf_obstacles else 0,
     }
 
 
@@ -282,6 +306,14 @@ def main() -> int:
     ap.add_argument(
         "--out", type=Path, default=None, help="output .npz (default: <scene_dir>/occupancy.npz)"
     )
+    ap.add_argument(
+        "--door-leaf-obstacles",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="burn OPEN door leaves into the grid as obstacles so paths route around the "
+        "swung panel (default on). --no-door-leaf-obstacles reverts to carving every door "
+        "fully free (legacy; the kinematic runtime then clips through the leaf)",
+    )
     args = ap.parse_args()
 
     # abspath (NOT resolve): keep symlinks intact. Scenes symlinked into the
@@ -292,7 +324,7 @@ def main() -> int:
     out = args.out or scene.parent / "occupancy.npz"
     print(f"Scene: {scene}")
 
-    r = build(scene, args.px_per_m, args.device_id)
+    r = build(scene, args.px_per_m, args.device_id, door_leaf_obstacles=args.door_leaf_obstacles)
     occ = r["occupancy"]
 
     np.savez(
@@ -309,7 +341,8 @@ def main() -> int:
 
     print(f"Grid:  {occ.shape[1]} x {occ.shape[0]} px  @ {r['px_per_m']:.1f} px/m")
     print(
-        f"Free:  {occ.mean():.1%} of the grid  |  walls: {r['n_walls']}  doors carved: {r['n_doors']}"
+        f"Free:  {occ.mean():.1%} of the grid  |  walls: {r['n_walls']}  "
+        f"door openings carved: {r['n_doors']}  open leaves burned: {r['n_door_leaves']}"
     )
     print(f"Rooms ({len(r['room_names'])}):")
     for i, name in enumerate(r["room_names"], start=1):

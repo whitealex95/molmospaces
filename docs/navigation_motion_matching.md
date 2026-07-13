@@ -387,10 +387,18 @@ shared run folder `nav_runs_mm/procthor-10k-val/val_2/01__room-2__to__room-11/`:
 
 | Variant | Subdir | Notes |
 |---|---|---|
-| 1. straight (vanilla) | `vanilla/` | no obstacle; 768 frames; lands 0.07 m from goal, ≈0.1 m mean (≤0.4 m max) drift |
-| 2. jump over box | `jump/` | `--obstacle 10.4,7.6,0.6,2.4,0.25,-118 --jump`; jump fires at 15.2 m, leaps the 0.25 m box (pelvis 0.78→1.01 m), 723 frames / 1 jump segment |
-| 3. detour around box | `detour/` | same box stamped via `plan.py --obstacle 10.4,7.6,0.6,2.4,-118`; A* swings ~1.8 m around it, 659 frames |
+| 1. straight (vanilla) | `vanilla/` | no obstacle; 610 frames |
+| 2. jump over box | `jump/` | `--obstacle 10.4,7.6,0.6,1.2,0.25,-118 --jump`; jump fires at 12.2 m, leaps the 0.25 m box (pelvis 0.78→1.01 m), 603 frames / 1 jump segment |
+| 3. detour around box | `detour/` | same box stamped via `plan.py --obstacle 10.4,7.6,0.6,1.2,-118`; A* swings ~1.3 m around it, 643 frames |
 
 The obstacle box is drawn both in the 3D scene (chase + ego views) **and** as a
-filled red footprint on the top-down map panel. (The older `velocity`-mode
-pure-pursuit run of variant 1 was 889 frames / 99 segments with looser drift.)
+filled red footprint on the top-down map panel. These were regenerated on the
+**door-leaf-aware** occupancy (`build_occupancy.py` now burns open door leaves as
+obstacles — see `docs/navigation_pipeline.md`), which raised the path's worst-case
+obstacle clearance ≈0.31 m → ≈0.55 m so the robot no longer clips swung-open door
+leaves. (The box width was reduced 2.4 m → **1.2 m** for the detour: on the
+corrected occupancy the doorway corridor here is only ~2.36 m wide, so a 2.4 m box
+plus the now-correctly-burned door leaf sealed the only route to room 11 and A\*
+found no detour; 1.2 m still forces a clear ~1.3 m swing while keeping it
+reachable.) (The older `velocity`-mode pure-pursuit run of variant 1 was 889
+frames / 99 segments with looser drift.)

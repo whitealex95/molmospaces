@@ -96,9 +96,19 @@ Scene MJCF → `occupancy.npz` (a robot-agnostic 2D occupancy + room grid).
    explicitly: project each wall geom's vertices to the floor plane, take the
    principal-axis segment (SVD), draw it as a thick line (`WALL_THICKNESS_M`
    = 0.12 m) into the obstacle layer.
-5. `carve_doors` — a doorway has a lintel above it, so it reads as obstacle and
-   gets sealed by the wall burn-in, but it is passable. Draw a *free* line along
-   each door geom's footprint (`DOOR_CARVE_M` = 0.6 m wide).
+5. **Doors** — `classify_geoms` splits door geoms into **openings** (the static
+   frame/threshold/lintel) and **leaves** (the swinging panel — a door geom whose
+   body carries a hinge joint; procthor leaves default to ~90° **open**). The open
+   **leaf** is burned in as an obstacle (`burn_walls(..., DOOR_LEAF_THICKNESS_M)`)
+   so a path routes around the swung panel instead of clipping through it, while
+   `carve_doors` draws a *free* line along each **opening** geom's footprint
+   (`DOOR_CARVE_M` = 0.6 m) so the doorway itself stays passable. The leaf burn runs
+   **after** the opening carve — otherwise the 0.6 m carve erases the part of the
+   swung leaf nearest the hinge, leaving only a stub. Gated by **`--door-leaf-obstacles`**
+   (`BooleanOptionalAction`, **default on**); `--no-door-leaf-obstacles` reverts to the
+   legacy behaviour of carving every door geom (opening + leaf) fully free, so an open
+   leaf leaves no obstacle and the kinematic, collision-free runtime lets the robot's
+   body pass through it.
 6. Build `room_map` (per-pixel room index from the floor-geom segmentation) and
    `room_names` (`clean_room_name` strips a `floor_` prefix, a floor tag like
    `F1_`, and the procthor `_visual_N` geom suffix).
